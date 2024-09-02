@@ -1,17 +1,27 @@
-﻿using DataMigrate2Postgres.AppDbContext;
+﻿using DataMigrate2Postgres;
+using DataMigrate2Postgres.AppDbContext;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 
 internal class Program
 {
-    static async  Task Main(string[] args)
+    static async Task Main(string[] args)
     {
         try
         {
+            // appsettings.json dosyasının doğru okunuyor mu?
+            var config = new ConfigurationBuilder()
+                .SetBasePath(Directory.GetCurrentDirectory())
+                .AddJsonFile("appsettings.json", optional: false, reloadOnChange: true)
+                .Build();
+
+            Console.WriteLine("SqlServer Connection String: " + config.GetConnectionString("SqlServer"));
+            Console.WriteLine("Postgres Connection String: " + config.GetConnectionString("Postgres"));
+
             var serviceProvider = new ServiceCollection()
-                .AddDbContext<SqlServerContext>(options => options.UseSqlServer(GetConnectionString("SqlServer")))
-                .AddDbContext<PostgresContext>(options => options.UseNpgsql(GetConnectionString("Postgres")))
+                .AddDbContext<SqlServerContext>(options => options.UseSqlServer(config.GetConnectionString("SqlServer")))
+                .AddDbContext<PostgresContext>(options => options.UseNpgsql(config.GetConnectionString("Postgres")))
                 .AddTransient<MigrationService>()
                 .BuildServiceProvider();
 
@@ -44,7 +54,7 @@ internal class Program
     {
         var config = new ConfigurationBuilder()
             .SetBasePath(Directory.GetCurrentDirectory())
-            .AddJsonFile("appsettings.json")
+            .AddJsonFile("AppSettings.json")
             .Build();
 
         return config.GetConnectionString(name);
