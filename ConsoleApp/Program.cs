@@ -8,8 +8,8 @@ internal class Program
 {
     private static void Main(string[] args)
     {
-        var sqlConnectionString = "Server=10.35.36.6;Database=MSO;User Id=sa;Password=Abc123def!!!;Integrated Security=False;TrustServerCertificate=True;";
-        var postgresConnectionString = "Host=10.35.36.6;Port=5434;Database=MSO;Username=sa;Password=Abc123def!!!;";
+        var sqlConnectionString = "Server=10.254.183.242;Database=Emptor_ProbilServis_Prod;User Id=ahmet.bilik;Password=Abc123def!!!;Integrated Security=False;TrustServerCertificate=True;";
+        var postgresConnectionString = "Host=10.254.183.242;Port=5433;Database=EmptorProbilServisProd;Username=sa;Password=Abc123def!!!;";
 
         using (var sqlConnection = new SqlConnection(sqlConnectionString))
         using (var postgresConnection = new NpgsqlConnection(postgresConnectionString))
@@ -146,6 +146,7 @@ internal class Program
                 return "uuid";
             case "datetime":
             case "date":
+            case "datetime2":
                 return "timestamp";
             case "bit":
                 return "boolean";
@@ -165,6 +166,7 @@ internal class Program
             case "real":
                 return "double precision";
             case "varbinary":
+            case "rowstamp":
                 return "bytea";
             default:
                 throw new NotSupportedException($"Unsupported SQL type: {sqlType}");
