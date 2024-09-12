@@ -3,13 +3,14 @@ using Microsoft.Data.SqlClient;
 using Npgsql;
 using System.Globalization;
 using System.Collections.Generic;
+using System.Linq;
 
 internal class Program
 {
     private static void Main(string[] args)
     {
         var sqlConnectionString = "Server=10.254.183.242;Database=Emptor_ProbilServis_Prod;User Id=ahmet.bilik;Password=Abc123def!!!;Integrated Security=False;TrustServerCertificate=True;";
-        var postgresConnectionString = "Host=10.254.183.242;Port=5433;Database=EmptorProbilServisProd;Username=sa;Password=Abc123def!!!;";
+        var postgresConnectionString = "Host=10.254.183.242;Port=5433;Database=EmptorProbilServisProd;Username=sa;Password=Abc123def!!!;Timeout=500";
 
         using (var sqlConnection = new SqlConnection(sqlConnectionString))
         using (var postgresConnection = new NpgsqlConnection(postgresConnectionString))
@@ -71,59 +72,70 @@ internal class Program
                         }
                     }
 
+                    // Veri yoksa INSERT işlemini atla
+                    var data = sqlConnection.Query($"SELECT * FROM \"{schema}\".\"{tableName}\"").ToList();
+
+                    if (data.Count == 0)
+                    {
+                        Console.WriteLine($"Table {schema}.{tableName} has no data, skipping insert.");
+                        continue;  // Verisi olmayan tabloyu atla
+                    }
+
                     var columnsForInsert = sqlConnection.Query($@"
                         SELECT COLUMN_NAME, DATA_TYPE, NUMERIC_PRECISION, NUMERIC_SCALE
                         FROM INFORMATION_SCHEMA.COLUMNS
                         WHERE TABLE_SCHEMA = '{schema}' AND TABLE_NAME = '{tableName}'");
 
-                    var data = sqlConnection.Query($"SELECT * FROM \"{schema}\".\"{tableName}\"");
-
-                    foreach (var row in data)
+                    using (var transaction = postgresConnection.BeginTransaction())
                     {
-                        string insertScript = $"INSERT INTO \"{schema}\".\"{tableName}\" (";
+                        const int batchSize = 1000; // Her 1000 kayıtta bir gönderim yap
+                        int rowCount = 0;
+                        var valueSets = new List<string>();
 
-                        foreach (var column in columnsForInsert)
+                        foreach (var row in data)
                         {
-                            insertScript += $"\"{column.COLUMN_NAME}\",";
-                        }
-
-                        insertScript = insertScript.TrimEnd(',') + ") VALUES (";
-
-                        using (var command = new NpgsqlCommand())
-                        {
-                            command.Connection = postgresConnection;
-
-                            var parameterNames = new List<string>();
-
+                            var values = new List<string>();
                             foreach (var column in columnsForInsert)
                             {
-                                string paramName = column.COLUMN_NAME;
-                                parameterNames.Add($"@{paramName}");
-
                                 var value = ((IDictionary<string, object>)row)[column.COLUMN_NAME];
-
-                                if (Convert.IsDBNull(value) || string.IsNullOrWhiteSpace(value?.ToString()))
-                                {
-                                    command.Parameters.AddWithValue(paramName, DBNull.Value);
-                                }
-                                else if (value is DateTime dateTimeValue)
-                                {
-                                    command.Parameters.AddWithValue(paramName, dateTimeValue);
-                                }
+                                if (value == null || Convert.IsDBNull(value))
+                                    values.Add("NULL");
+                                else if (value is DateTime)
+                                    values.Add($"'{((DateTime)value).ToString("yyyy-MM-dd HH:mm:ss")}'");
                                 else if (value is decimal || value is double || value is float)
-                                {
-                                    command.Parameters.AddWithValue(paramName, value);
-                                }
+                                    values.Add(value.ToString().Replace(",", "."));  // Virgülleri nokta ile değiştir
                                 else
-                                {
-                                    command.Parameters.AddWithValue(paramName, value);
-                                }
+                                    values.Add($"'{value.ToString().Replace("'", "''")}'");
                             }
+                            valueSets.Add($"({string.Join(",", values)})");
 
-                            insertScript += string.Join(",", parameterNames) + ");";
-                            command.CommandText = insertScript;
-                            command.ExecuteNonQuery();
+                            rowCount++;
+
+                            // Her batchSize kadar bir ekleme yap
+                            if (rowCount % batchSize == 0)
+                            {
+                                string insertScript = $"INSERT INTO \"{schema}\".\"{tableName}\" ({string.Join(",", columnsForInsert.Select(c => $"\"{c.COLUMN_NAME}\""))}) VALUES {string.Join(",", valueSets)};";
+                                using (var command = new NpgsqlCommand(insertScript, postgresConnection, transaction))
+                                {
+                                    command.ExecuteNonQuery();
+                                }
+
+                                // İşlem sonrasında listeyi temizle
+                                valueSets.Clear();
+                            }
                         }
+
+                        // Kalan veriler varsa son bir kez daha gönder
+                        if (valueSets.Any())
+                        {
+                            string insertScript = $"INSERT INTO \"{schema}\".\"{tableName}\" ({string.Join(",", columnsForInsert.Select(c => $"\"{c.COLUMN_NAME}\""))}) VALUES {string.Join(",", valueSets)};";
+                            using (var command = new NpgsqlCommand(insertScript, postgresConnection, transaction))
+                            {
+                                command.ExecuteNonQuery();
+                            }
+                        }
+
+                        transaction.Commit();
                     }
                 }
             }
@@ -167,10 +179,14 @@ internal class Program
                 return "double precision";
             case "varbinary":
             case "rowstamp":
+            case "timestamp":
                 return "bytea";
+            case "money":
+                return "numeric(19,4)";
+            case "xml":
+                return "xml";
             default:
                 throw new NotSupportedException($"Unsupported SQL type: {sqlType}");
         }
     }
-
 }
