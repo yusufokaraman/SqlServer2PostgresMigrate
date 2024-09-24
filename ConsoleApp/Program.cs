@@ -3,6 +3,7 @@ using Microsoft.Data.SqlClient;
 using Npgsql;
 using System.Collections.Generic;
 using System.IO;
+using System.Linq;
 
 internal class Program
 {
@@ -11,8 +12,10 @@ internal class Program
         var logFilePath = "migration_log.txt";
         File.WriteAllText(logFilePath, "Migration process started...\n");
 
-        var sqlConnectionString = "Server=10.254.183.242;Database=Emptor_ProbilServis_Prod;User Id=ahmet.bilik;Password=Abc123def!!!;Integrated Security=False;TrustServerCertificate=True;";
+        var sqlConnectionString = "Server=10.254.183.242;Database=Emptor_ProbilServis_Prod;User Id=ahmet.bilik;Password=Abc123def!!!;Integrated Security=False;TrustServerCertificate=True;Connect Timeout=120;";
         var postgresConnectionString = "Host=10.254.183.242;Port=5433;Database=EmptorProbilServisProd;Username=sa;Password=Abc123def!!!;Timeout=500";
+
+        List<(string schema, string tableName)> errorTablesQueue = new List<(string schema, string tableName)>();
 
         try
         {
@@ -28,139 +31,44 @@ internal class Program
                 Console.WriteLine($"Total number of tables to process: {totalTables}");
                 Log(logFilePath, $"Total number of tables to process: {totalTables}");
 
+                int currentTableIndex = 0;
+
                 foreach (var table in tables)
                 {
+                    currentTableIndex++;
                     string schema = table.TABLE_SCHEMA;
                     string tableName = table.TABLE_NAME;
 
-                    Console.WriteLine($"Processing table: {schema}.{tableName}");
-                    Log(logFilePath, $"Processing table: {schema}.{tableName}");
+                    // İlerleme yüzdesi
+                    double progressPercentage = (double)currentTableIndex / totalTables * 100;
+                    Console.WriteLine($"Processing table {currentTableIndex}/{totalTables} ({progressPercentage:F2}% complete): {schema}.{tableName}");
+                    Log(logFilePath, $"Processing table {currentTableIndex}/{totalTables} ({progressPercentage:F2}% complete): {schema}.{tableName}");
 
-                    // PostgreSQL'de şemayı oluştur
-                    var createSchemaScript = $"CREATE SCHEMA IF NOT EXISTS \"{schema}\"";
-                    using (var schemaCommand = new NpgsqlCommand(createSchemaScript, postgresConnection))
+                    try
                     {
-                        schemaCommand.ExecuteNonQuery();
+                        ProcessTable(sqlConnection, postgresConnection, schema, tableName, logFilePath);
                     }
-
-                    // PostgreSQL'de tablo var mı kontrolü
-                    string checkTableExistsScript = $@"
-                        SELECT EXISTS (
-                            SELECT 1 
-                            FROM information_schema.tables 
-                            WHERE table_schema = '{schema}' 
-                            AND table_name = '{tableName}'
-                        );";
-
-                    using (var checkTableCommand = new NpgsqlCommand(checkTableExistsScript, postgresConnection))
+                    catch (Exception tableEx)
                     {
-                        bool tableExists = (bool)checkTableCommand.ExecuteScalar();
-
-                        if (!tableExists)
-                        {
-                            // SQL Server'dan tabloyu al ve PostgreSQL'de oluştur
-                            var columns = sqlConnection.Query($@"
-                                SELECT COLUMN_NAME, DATA_TYPE, NUMERIC_PRECISION, NUMERIC_SCALE
-                                FROM INFORMATION_SCHEMA.COLUMNS
-                                WHERE TABLE_SCHEMA = '{schema}' AND TABLE_NAME = '{tableName}'");
-
-                            string createTableScript = $"CREATE TABLE \"{schema}\".\"{tableName}\" (";
-                            foreach (var column in columns)
-                            {
-                                string columnName = column.COLUMN_NAME;
-                                string dataType = ConvertSqlTypeToPostgres(column.DATA_TYPE, column.NUMERIC_PRECISION, column.NUMERIC_SCALE);
-                                createTableScript += $"\"{columnName}\" {dataType},";
-                            }
-                            createTableScript = createTableScript.TrimEnd(',') + ");";
-
-                            using (var createCommand = new NpgsqlCommand(createTableScript, postgresConnection))
-                            {
-                                createCommand.ExecuteNonQuery();
-                            }
-                        }
+                        errorTablesQueue.Add((schema, tableName));
+                        Log(logFilePath, $"Error processing table {schema}.{tableName}: {tableEx.Message}");
                     }
-
-                    // Veritabanında veri olup olmadığını kontrol et
-                    var rowCount = sqlConnection.QuerySingle<int>($"SELECT COUNT(*) FROM [{schema}].[{tableName}]");
-                    if (rowCount == 0)
-                    {
-                        Console.WriteLine($"Table {schema}.{tableName} has no data, skipping insert.");
-                        Log(logFilePath, $"Table {schema}.{tableName} has no data, skipping insert.");
-                        continue; 
-                    }
-
-                    // SQL Server'dan büyük veriyi memory'e yüklemeden okuma
-                    var columnsForInsert = sqlConnection.Query($@"
-                        SELECT COLUMN_NAME, DATA_TYPE, NUMERIC_PRECISION, NUMERIC_SCALE
-                        FROM INFORMATION_SCHEMA.COLUMNS
-                        WHERE TABLE_SCHEMA = '{schema}' AND TABLE_NAME = '{tableName}'");
-
-                    using (var transaction = postgresConnection.BeginTransaction())
-                    using (var sqlCommand = new SqlCommand($"SELECT * FROM [{schema}].[{tableName}]", sqlConnection))
-                    {
-                        sqlCommand.CommandTimeout = 1800;
-                        using (var reader = sqlCommand.ExecuteReader(System.Data.CommandBehavior.SequentialAccess))
-                        {
-                            const int batchSize = 1000;
-                            int rowCountBatch = 0;
-                            var valueSets = new List<string>();
-
-                            while (reader.Read())
-                            {
-                                var values = new List<string>();
-
-                                foreach (var column in columnsForInsert)
-                                {
-                                    var value = reader[column.COLUMN_NAME];
-
-                                    // Null ve DBNull kontrolleri
-                                    if (value == null || Convert.IsDBNull(value))
-                                    {
-                                        values.Add("NULL");
-                                    }
-                                    else if (value is DateTime)
-                                    {
-                                        values.Add($"'{((DateTime)value).ToString("yyyy-MM-dd HH:mm:ss")}'");
-                                    }
-                                    else if (value is decimal || value is double || value is float)
-                                    {
-                                        values.Add(value.ToString().Replace(",", "."));
-                                    }
-                                    else
-                                    {
-                                        values.Add($"'{value.ToString().Replace("'", "''")}'");
-                                    }
-                                }
-
-                                valueSets.Add($"({string.Join(",", values)})");
-                                rowCountBatch++;
-
-                                if (rowCountBatch % batchSize == 0)
-                                {
-                                    string insertScript = $"INSERT INTO \"{schema}\".\"{tableName}\" ({string.Join(",", columnsForInsert.Select(c => $"\"{c.COLUMN_NAME}\""))}) VALUES {string.Join(",", valueSets)};";
-                                    using (var command = new NpgsqlCommand(insertScript, postgresConnection, transaction))
-                                    {
-                                        command.ExecuteNonQuery();
-                                    }
-                                    valueSets.Clear();
-                                }
-                            }
-
-                            if (valueSets.Any())
-                            {
-                                string insertScript = $"INSERT INTO \"{schema}\".\"{tableName}\" ({string.Join(",", columnsForInsert.Select(c => $"\"{c.COLUMN_NAME}\""))}) VALUES {string.Join(",", valueSets)};";
-                                using (var command = new NpgsqlCommand(insertScript, postgresConnection, transaction))
-                                {
-                                    command.ExecuteNonQuery();
-                                }
-                            }
-
-                            transaction.Commit();
-                        }
-                    }
-                    Console.WriteLine($"Table {schema}.{tableName} processed successfully.");
-                    Log(logFilePath, $"Table {schema}.{tableName} processed successfully.");
                 }
+
+                // Hata alınan tabloları tekrar dene
+                foreach (var (schema, tableName) in errorTablesQueue)
+                {
+                    try
+                    {
+                        Console.WriteLine($"Retrying table {schema}.{tableName}");
+                        ProcessTable(sqlConnection, postgresConnection, schema, tableName, logFilePath);
+                    }
+                    catch (Exception retryEx)
+                    {
+                        Log(logFilePath, $"Retry failed for table {schema}.{tableName}: {retryEx.Message}");
+                    }
+                }
+
                 Console.WriteLine("All tables processed successfully.");
                 Log(logFilePath, "All tables processed successfully.");
             }
@@ -172,9 +80,137 @@ internal class Program
         }
     }
 
+    static void ProcessTable(SqlConnection sqlConnection, NpgsqlConnection postgresConnection, string schema, string tableName, string logFilePath)
+    {
+        // PostgreSQL'de şemayı oluştur
+        var createSchemaScript = $"CREATE SCHEMA IF NOT EXISTS \"{schema}\"";
+        using (var schemaCommand = new NpgsqlCommand(createSchemaScript, postgresConnection))
+        {
+            schemaCommand.ExecuteNonQuery();
+        }
+
+        // PostgreSQL'de tablo var mı kontrolü
+        string checkTableExistsScript = $@"
+            SELECT EXISTS (
+                SELECT 1 
+                FROM information_schema.tables 
+                WHERE table_schema = '{schema}' 
+                AND table_name = '{tableName}'
+            );";
+
+        using (var checkTableCommand = new NpgsqlCommand(checkTableExistsScript, postgresConnection))
+        {
+            bool tableExists = (bool)checkTableCommand.ExecuteScalar();
+
+            if (!tableExists)
+            {
+                // SQL Server'dan tabloyu al ve PostgreSQL'de oluştur
+                var columns = sqlConnection.Query($@"
+                    SELECT COLUMN_NAME, DATA_TYPE, NUMERIC_PRECISION, NUMERIC_SCALE
+                    FROM INFORMATION_SCHEMA.COLUMNS
+                    WHERE TABLE_SCHEMA = '{schema}' AND TABLE_NAME = '{tableName}'");
+
+                string createTableScript = $"CREATE TABLE \"{schema}\".\"{tableName}\" (";
+                foreach (var column in columns)
+                {
+                    string columnName = column.COLUMN_NAME;
+                    string dataType = ConvertSqlTypeToPostgres(column.DATA_TYPE, column.NUMERIC_PRECISION, column.NUMERIC_SCALE);
+                    createTableScript += $"\"{columnName}\" {dataType},";
+                }
+                createTableScript = createTableScript.TrimEnd(',') + ");";
+
+                using (var createCommand = new NpgsqlCommand(createTableScript, postgresConnection))
+                {
+                    createCommand.ExecuteNonQuery();
+                }
+            }
+        }
+
+        // Veritabanında veri olup olmadığını kontrol et
+        var rowCount = sqlConnection.QuerySingle<int>($"SELECT COUNT(*) FROM [{schema}].[{tableName}]");
+        if (rowCount == 0)
+        {
+            Console.WriteLine($"Table {schema}.{tableName} has no data, skipping insert.");
+            Log(logFilePath, $"Table {schema}.{tableName} has no data, skipping insert.");
+            return;
+        }
+
+        // SQL Server'dan büyük veriyi memory'e yüklemeden okuma
+        var columnsForInsert = sqlConnection.Query($@"
+            SELECT COLUMN_NAME, DATA_TYPE, NUMERIC_PRECISION, NUMERIC_SCALE
+            FROM INFORMATION_SCHEMA.COLUMNS
+            WHERE TABLE_SCHEMA = '{schema}' AND TABLE_NAME = '{tableName}'");
+
+        using (var transaction = postgresConnection.BeginTransaction())
+        using (var sqlCommand = new SqlCommand($"SELECT * FROM [{schema}].[{tableName}]", sqlConnection))
+        {
+            sqlCommand.CommandTimeout = 1800;
+            using (var reader = sqlCommand.ExecuteReader(System.Data.CommandBehavior.SequentialAccess))
+            {
+                const int batchSize = 1000;
+                int rowCountBatch = 0;
+                var valueSets = new List<string>();
+
+                while (reader.Read())
+                {
+                    var values = new List<string>();
+
+                    foreach (var column in columnsForInsert)
+                    {
+                        var value = reader[column.COLUMN_NAME];
+
+                        // Null ve DBNull kontrolleri
+                        if (value == null || Convert.IsDBNull(value))
+                        {
+                            values.Add("NULL");
+                        }
+                        else if (value is DateTime)
+                        {
+                            values.Add($"'{((DateTime)value).ToString("yyyy-MM-dd HH:mm:ss")}'");
+                        }
+                        else if (value is decimal || value is double || value is float)
+                        {
+                            values.Add(value.ToString().Replace(",", "."));
+                        }
+                        else
+                        {
+                            values.Add($"'{value.ToString().Replace("'", "''")}'");
+                        }
+                    }
+
+                    valueSets.Add($"({string.Join(",", values)})");
+                    rowCountBatch++;
+
+                    if (rowCountBatch % batchSize == 0)
+                    {
+                        string insertScript = $"INSERT INTO \"{schema}\".\"{tableName}\" ({string.Join(",", columnsForInsert.Select(c => $"\"{c.COLUMN_NAME}\""))}) VALUES {string.Join(",", valueSets)};";
+                        using (var command = new NpgsqlCommand(insertScript, postgresConnection, transaction))
+                        {
+                            command.ExecuteNonQuery();
+                        }
+                        valueSets.Clear();
+                    }
+                }
+
+                if (valueSets.Any())
+                {
+                    string insertScript = $"INSERT INTO \"{schema}\".\"{tableName}\" ({string.Join(",", columnsForInsert.Select(c => $"\"{c.COLUMN_NAME}\""))}) VALUES {string.Join(",", valueSets)};";
+                    using (var command = new NpgsqlCommand(insertScript, postgresConnection, transaction))
+                    {
+                        command.ExecuteNonQuery();
+                    }
+                }
+
+                transaction.Commit();
+            }
+        }
+
+        Console.WriteLine($"Table {schema}.{tableName} processed successfully.");
+        Log(logFilePath, $"Table {schema}.{tableName} processed successfully.");
+    }
+
     static string ConvertSqlTypeToPostgres(string sqlType, object numericPrecision, object numericScale)
     {
-        // SQL tiplerini PostgreSQL tiplerine dönüştürme
         switch (sqlType.ToLower())
         {
             case "nvarchar":
