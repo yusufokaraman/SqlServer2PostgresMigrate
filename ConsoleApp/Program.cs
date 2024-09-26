@@ -4,10 +4,15 @@ using Npgsql;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Threading;
+using System.Threading.Tasks;
 
 internal class Program
 {
-    private static void Main(string[] args)
+    private static readonly object fileLock = new object(); 
+    private static SemaphoreSlim semaphore = new SemaphoreSlim(20); 
+
+    private static async Task Main(string[] args)
     {
         var logFilePath = "migration_log.txt";
         File.WriteAllText(logFilePath, "Migration process started...\n");
@@ -22,8 +27,8 @@ internal class Program
             using (var sqlConnection = new SqlConnection(sqlConnectionString))
             using (var postgresConnection = new NpgsqlConnection(postgresConnectionString))
             {
-                sqlConnection.Open();
-                postgresConnection.Open();
+                await sqlConnection.OpenAsync();
+                await postgresConnection.OpenAsync();
                 Log(logFilePath, "Connected to both SQL Server and PostgreSQL");
 
                 var tables = sqlConnection.Query("SELECT TABLE_SCHEMA, TABLE_NAME FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_TYPE = 'BASE TABLE'").ToList();
@@ -31,6 +36,7 @@ internal class Program
                 Console.WriteLine($"Total number of tables to process: {totalTables}");
                 Log(logFilePath, $"Total number of tables to process: {totalTables}");
 
+                var tasks = new List<Task>();
                 int currentTableIndex = 0;
 
                 foreach (var table in tables)
@@ -39,21 +45,39 @@ internal class Program
                     string schema = table.TABLE_SCHEMA;
                     string tableName = table.TABLE_NAME;
 
-                    // İlerleme yüzdesi
                     double progressPercentage = (double)currentTableIndex / totalTables * 100;
                     Console.WriteLine($"Processing table {currentTableIndex}/{totalTables} ({progressPercentage:F2}% complete): {schema}.{tableName}");
                     Log(logFilePath, $"Processing table {currentTableIndex}/{totalTables} ({progressPercentage:F2}% complete): {schema}.{tableName}");
 
-                    try
+                    await semaphore.WaitAsync();
+
+                    tasks.Add(Task.Run(async () =>
                     {
-                        ProcessTable(sqlConnection, postgresConnection, schema, tableName, logFilePath);
-                    }
-                    catch (Exception tableEx)
-                    {
-                        errorTablesQueue.Add((schema, tableName));
-                        Log(logFilePath, $"Error processing table {schema}.{tableName}: {tableEx.Message}");
-                    }
+                        try
+                        {
+                            using (var sqlConn = new SqlConnection(sqlConnectionString))
+                            using (var pgConn = new NpgsqlConnection(postgresConnectionString))
+                            {
+                                await sqlConn.OpenAsync();
+                                await pgConn.OpenAsync();
+
+                                EnsureOpenConnection(sqlConn, pgConn);
+                                await ProcessTableAsync(sqlConn, pgConn, schema, tableName, logFilePath);
+                            }
+                        }
+                        catch (Exception ex)
+                        {
+                            errorTablesQueue.Add((schema, tableName));
+                            Log(logFilePath, $"Error processing table {schema}.{tableName}: {ex.Message}");
+                        }
+                        finally
+                        {
+                            semaphore.Release();
+                        }
+                    }));
                 }
+
+                await Task.WhenAll(tasks);
 
                 // Hata alınan tabloları tekrar dene
                 foreach (var (schema, tableName) in errorTablesQueue)
@@ -61,7 +85,8 @@ internal class Program
                     try
                     {
                         Console.WriteLine($"Retrying table {schema}.{tableName}");
-                        ProcessTable(sqlConnection, postgresConnection, schema, tableName, logFilePath);
+                        EnsureOpenConnection(sqlConnection, postgresConnection);
+                        await ProcessTableAsync(sqlConnection, postgresConnection, schema, tableName, logFilePath);
                     }
                     catch (Exception retryEx)
                     {
@@ -80,16 +105,27 @@ internal class Program
         }
     }
 
-    static void ProcessTable(SqlConnection sqlConnection, NpgsqlConnection postgresConnection, string schema, string tableName, string logFilePath)
+    static void EnsureOpenConnection(SqlConnection sqlConnection, NpgsqlConnection postgresConnection)
     {
-        // PostgreSQL'de şemayı oluştur
+        if (sqlConnection.State != System.Data.ConnectionState.Open)
+        {
+            sqlConnection.Open();
+        }
+
+        if (postgresConnection.State != System.Data.ConnectionState.Open)
+        {
+            postgresConnection.Open();
+        }
+    }
+
+    static async Task ProcessTableAsync(SqlConnection sqlConnection, NpgsqlConnection postgresConnection, string schema, string tableName, string logFilePath)
+    {
         var createSchemaScript = $"CREATE SCHEMA IF NOT EXISTS \"{schema}\"";
         using (var schemaCommand = new NpgsqlCommand(createSchemaScript, postgresConnection))
         {
-            schemaCommand.ExecuteNonQuery();
+            await schemaCommand.ExecuteNonQueryAsync();
         }
 
-        // PostgreSQL'de tablo var mı kontrolü
         string checkTableExistsScript = $@"
             SELECT EXISTS (
                 SELECT 1 
@@ -100,11 +136,10 @@ internal class Program
 
         using (var checkTableCommand = new NpgsqlCommand(checkTableExistsScript, postgresConnection))
         {
-            bool tableExists = (bool)checkTableCommand.ExecuteScalar();
+            bool tableExists = (bool)await checkTableCommand.ExecuteScalarAsync();
 
             if (!tableExists)
             {
-                // SQL Server'dan tabloyu al ve PostgreSQL'de oluştur
                 var columns = sqlConnection.Query($@"
                     SELECT COLUMN_NAME, DATA_TYPE, NUMERIC_PRECISION, NUMERIC_SCALE
                     FROM INFORMATION_SCHEMA.COLUMNS
@@ -121,13 +156,12 @@ internal class Program
 
                 using (var createCommand = new NpgsqlCommand(createTableScript, postgresConnection))
                 {
-                    createCommand.ExecuteNonQuery();
+                    await createCommand.ExecuteNonQueryAsync();
                 }
             }
         }
 
-        // Veritabanında veri olup olmadığını kontrol et
-        var rowCount = sqlConnection.QuerySingle<int>($"SELECT COUNT(*) FROM [{schema}].[{tableName}]");
+        var rowCount = await sqlConnection.QuerySingleAsync<int>($"SELECT COUNT(*) FROM [{schema}].[{tableName}]");
         if (rowCount == 0)
         {
             Console.WriteLine($"Table {schema}.{tableName} has no data, skipping insert.");
@@ -135,23 +169,21 @@ internal class Program
             return;
         }
 
-        // SQL Server'dan büyük veriyi memory'e yüklemeden okuma
         var columnsForInsert = sqlConnection.Query($@"
             SELECT COLUMN_NAME, DATA_TYPE, NUMERIC_PRECISION, NUMERIC_SCALE
             FROM INFORMATION_SCHEMA.COLUMNS
             WHERE TABLE_SCHEMA = '{schema}' AND TABLE_NAME = '{tableName}'");
 
-        using (var transaction = postgresConnection.BeginTransaction())
         using (var sqlCommand = new SqlCommand($"SELECT * FROM [{schema}].[{tableName}]", sqlConnection))
         {
             sqlCommand.CommandTimeout = 1800;
-            using (var reader = sqlCommand.ExecuteReader(System.Data.CommandBehavior.SequentialAccess))
+            using (var reader = await sqlCommand.ExecuteReaderAsync(System.Data.CommandBehavior.SequentialAccess))
             {
                 const int batchSize = 1000;
                 int rowCountBatch = 0;
                 var valueSets = new List<string>();
 
-                while (reader.Read())
+                while (await reader.ReadAsync())
                 {
                     var values = new List<string>();
 
@@ -159,7 +191,6 @@ internal class Program
                     {
                         var value = reader[column.COLUMN_NAME];
 
-                        // Null ve DBNull kontrolleri
                         if (value == null || Convert.IsDBNull(value))
                         {
                             values.Add("NULL");
@@ -183,30 +214,34 @@ internal class Program
 
                     if (rowCountBatch % batchSize == 0)
                     {
-                        string insertScript = $"INSERT INTO \"{schema}\".\"{tableName}\" ({string.Join(",", columnsForInsert.Select(c => $"\"{c.COLUMN_NAME}\""))}) VALUES {string.Join(",", valueSets)};";
-                        using (var command = new NpgsqlCommand(insertScript, postgresConnection, transaction))
-                        {
-                            command.ExecuteNonQuery();
-                        }
+                        await ExecuteBatchInsertAsync(postgresConnection, schema, tableName, valueSets, columnsForInsert);
                         valueSets.Clear();
                     }
                 }
 
                 if (valueSets.Any())
                 {
-                    string insertScript = $"INSERT INTO \"{schema}\".\"{tableName}\" ({string.Join(",", columnsForInsert.Select(c => $"\"{c.COLUMN_NAME}\""))}) VALUES {string.Join(",", valueSets)};";
-                    using (var command = new NpgsqlCommand(insertScript, postgresConnection, transaction))
-                    {
-                        command.ExecuteNonQuery();
-                    }
+                    await ExecuteBatchInsertAsync(postgresConnection, schema, tableName, valueSets, columnsForInsert);
                 }
-
-                transaction.Commit();
             }
         }
 
         Console.WriteLine($"Table {schema}.{tableName} processed successfully.");
         Log(logFilePath, $"Table {schema}.{tableName} processed successfully.");
+    }
+
+    static async Task ExecuteBatchInsertAsync(NpgsqlConnection postgresConnection, string schema, string tableName, List<string> valueSets, IEnumerable<dynamic> columnsForInsert)
+    {
+        using (var transaction = await postgresConnection.BeginTransactionAsync())
+        {
+            string insertScript = $"INSERT INTO \"{schema}\".\"{tableName}\" ({string.Join(",", columnsForInsert.Select(c => $"\"{c.COLUMN_NAME}\""))}) VALUES {string.Join(",", valueSets)};";
+            using (var command = new NpgsqlCommand(insertScript, postgresConnection, transaction))
+            {
+                await command.ExecuteNonQueryAsync();
+            }
+
+            await transaction.CommitAsync();
+        }
     }
 
     static string ConvertSqlTypeToPostgres(string sqlType, object numericPrecision, object numericScale)
@@ -256,6 +291,9 @@ internal class Program
 
     static void Log(string filePath, string message)
     {
-        File.AppendAllText(filePath, $"{DateTime.Now}: {message}\n");
+        lock (fileLock) // Dosya erişimini kilitliyoruz
+        {
+            File.AppendAllText(filePath, $"{DateTime.Now}: {message}\n");
+        }
     }
 }
