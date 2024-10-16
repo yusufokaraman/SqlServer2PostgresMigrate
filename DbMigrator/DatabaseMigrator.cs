@@ -1,11 +1,8 @@
-﻿using Npgsql;
-using System;
-using System.Collections.Generic;
-using System.Data.SqlClient;
-using System.IO;
-using System.Linq;
+﻿using CsvHelper;
+using Microsoft.Data.SqlClient;
+using Npgsql;
+using System.Globalization;
 using System.Text;
-using System.Threading.Tasks;
 
 namespace DbMigrator
 {
@@ -49,13 +46,21 @@ namespace DbMigrator
                 }
 
                 Console.WriteLine("Veritabanı aktarımı tamamlandı.");
+
+                // Hatalı tabloları tekrar dene
                 await RetryFailedTables(sqlConn, pgConn);
+
+                // Yabancı anahtarları aktarma
+                await MigrateForeignKeysAsync(sqlConn, pgConn);
+
+                Console.WriteLine("Yabancı anahtarlar başarıyla aktarıldı.");
             }
             catch (Exception ex)
             {
                 Console.WriteLine($"Veritabanı aktarımı sırasında hata: {ex.Message}");
             }
         }
+
 
         private async Task EnsureConnectionOpen(NpgsqlConnection pgConn)
         {
@@ -69,7 +74,29 @@ namespace DbMigrator
         private async Task<List<TableDefinition>> GetTableDefinitions(SqlConnection sqlConn)
         {
             var tables = new List<TableDefinition>();
-            var query = "SELECT TABLE_NAME, TABLE_SCHEMA, COLUMN_NAME, DATA_TYPE, IS_NULLABLE FROM INFORMATION_SCHEMA.COLUMNS";
+            var query = @"
+        SELECT 
+            tc.TABLE_NAME, 
+            tc.TABLE_SCHEMA,
+            c.COLUMN_NAME,
+            c.DATA_TYPE,
+            c.IS_NULLABLE,
+            CASE WHEN pk.COLUMN_NAME IS NOT NULL THEN 1 ELSE 0 END AS IS_PRIMARY_KEY
+        FROM INFORMATION_SCHEMA.COLUMNS c
+        INNER JOIN INFORMATION_SCHEMA.TABLES tc ON c.TABLE_NAME = tc.TABLE_NAME AND c.TABLE_SCHEMA = tc.TABLE_SCHEMA
+        LEFT JOIN (
+            SELECT ku.TABLE_CATALOG,ku.TABLE_SCHEMA,ku.TABLE_NAME,ku.COLUMN_NAME
+            FROM INFORMATION_SCHEMA.TABLE_CONSTRAINTS AS tc
+            INNER JOIN INFORMATION_SCHEMA.KEY_COLUMN_USAGE AS ku
+                ON tc.CONSTRAINT_TYPE = 'PRIMARY KEY' 
+                AND tc.CONSTRAINT_NAME = ku.CONSTRAINT_NAME
+        ) pk 
+            ON c.TABLE_CATALOG = pk.TABLE_CATALOG 
+            AND c.TABLE_SCHEMA = pk.TABLE_SCHEMA 
+            AND c.TABLE_NAME = pk.TABLE_NAME 
+            AND c.COLUMN_NAME = pk.COLUMN_NAME
+        WHERE tc.TABLE_TYPE = 'BASE TABLE';
+    ";
 
             using (var command = new SqlCommand(query, sqlConn))
             using (var reader = await command.ExecuteReaderAsync())
@@ -81,32 +108,126 @@ namespace DbMigrator
                     var columnName = reader["COLUMN_NAME"].ToString();
                     var dataType = reader["DATA_TYPE"].ToString();
                     var isNullable = reader["IS_NULLABLE"].ToString() == "YES";
+                    var isPrimaryKey = Convert.ToBoolean(reader["IS_PRIMARY_KEY"]);
 
-                    var table = tables.Find(t => t.Name == tableName && t.Schema == tableSchema) ?? new TableDefinition { Name = tableName, Schema = tableSchema };
-                    table.Columns.Add(new ColumnDefinition { Name = columnName, SqlDataType = dataType, IsNullable = isNullable });
-
-                    if (!tables.Contains(table))
+                    var table = tables.FirstOrDefault(t => t.Name == tableName && t.Schema == tableSchema);
+                    if (table == null)
+                    {
+                        table = new TableDefinition { Name = tableName, Schema = tableSchema };
                         tables.Add(table);
+                    }
+
+                    table.Columns.Add(new ColumnDefinition
+                    {
+                        Name = columnName,
+                        SqlDataType = dataType,
+                        IsNullable = isNullable,
+                        IsPrimaryKey = isPrimaryKey
+                    });
                 }
             }
 
             return tables;
         }
 
+
         private string GenerateCreateTableScript(TableDefinition table)
         {
             var sb = new StringBuilder();
             sb.AppendLine($"CREATE TABLE IF NOT EXISTS \"{table.Schema}\".\"{table.Name}\" (");
 
-            foreach (var column in table.Columns)
+            var columnDefinitions = table.Columns.Select(column =>
+                $"\"{column.Name}\" {GetPostgreSqlDataType(column.SqlDataType)} {(column.IsNullable ? "NULL" : "NOT NULL")}");
+
+            var columnsAndConstraints = new List<string>();
+            columnsAndConstraints.AddRange(columnDefinitions);
+
+            if (table.Columns.Any(c => c.IsPrimaryKey))
             {
-                var isLastColumn = column == table.Columns.Last();
-                sb.AppendLine($"\"{column.Name}\" {GetPostgreSqlDataType(column.SqlDataType)} {(column.IsNullable ? "NULL" : "NOT NULL")}{(isLastColumn ? "" : ",")}");
+                var primaryKeyColumns = table.Columns.Where(c => c.IsPrimaryKey).Select(c => $"\"{c.Name}\"");
+                columnsAndConstraints.Add($"PRIMARY KEY ({string.Join(", ", primaryKeyColumns)})");
             }
+
+            sb.AppendLine(string.Join(",\n", columnsAndConstraints));
 
             sb.AppendLine(");");
             return sb.ToString();
         }
+
+
+        private async Task<List<ForeignKeyDefinition>> GetForeignKeyDefinitions(SqlConnection sqlConn)
+        {
+            var foreignKeys = new List<ForeignKeyDefinition>();
+            var query = @"
+        SELECT 
+            fk.CONSTRAINT_NAME,
+            fk.TABLE_SCHEMA AS FK_SCHEMA,
+            fk.TABLE_NAME AS FK_TABLE,
+            kcu.COLUMN_NAME AS FK_COLUMN,
+            pk.TABLE_SCHEMA AS PK_SCHEMA,
+            pk.TABLE_NAME AS PK_TABLE,
+            kcu2.COLUMN_NAME AS PK_COLUMN
+        FROM INFORMATION_SCHEMA.REFERENTIAL_CONSTRAINTS rc
+        INNER JOIN INFORMATION_SCHEMA.TABLE_CONSTRAINTS fk ON rc.CONSTRAINT_NAME = fk.CONSTRAINT_NAME
+        INNER JOIN INFORMATION_SCHEMA.TABLE_CONSTRAINTS pk ON rc.UNIQUE_CONSTRAINT_NAME = pk.CONSTRAINT_NAME
+        INNER JOIN INFORMATION_SCHEMA.KEY_COLUMN_USAGE kcu ON fk.CONSTRAINT_NAME = kcu.CONSTRAINT_NAME
+        INNER JOIN INFORMATION_SCHEMA.KEY_COLUMN_USAGE kcu2 ON pk.CONSTRAINT_NAME = kcu2.CONSTRAINT_NAME AND kcu.ORDINAL_POSITION = kcu2.ORDINAL_POSITION
+        ORDER BY fk.TABLE_NAME, kcu.COLUMN_NAME;
+    ";
+
+            using (var command = new SqlCommand(query, sqlConn))
+            using (var reader = await command.ExecuteReaderAsync())
+            {
+                while (await reader.ReadAsync())
+                {
+                    foreignKeys.Add(new ForeignKeyDefinition
+                    {
+                        ConstraintName = reader["CONSTRAINT_NAME"].ToString(),
+                        ForeignKeySchema = reader["FK_SCHEMA"].ToString(),
+                        ForeignKeyTable = reader["FK_TABLE"].ToString(),
+                        ForeignKeyColumn = reader["FK_COLUMN"].ToString(),
+                        PrimaryKeySchema = reader["PK_SCHEMA"].ToString(),
+                        PrimaryKeyTable = reader["PK_TABLE"].ToString(),
+                        PrimaryKeyColumn = reader["PK_COLUMN"].ToString()
+                    });
+                }
+            }
+
+            return foreignKeys;
+        }
+
+        public async Task MigrateForeignKeysAsync(SqlConnection sqlConn, NpgsqlConnection pgConn)
+        {
+            var foreignKeys = await GetForeignKeyDefinitions(sqlConn);
+
+            foreach (var fk in foreignKeys)
+            {
+                try
+                {
+                    var alterTableScript = $@"
+                ALTER TABLE ""{fk.ForeignKeySchema}"".""{fk.ForeignKeyTable}""
+                ADD CONSTRAINT ""{fk.ConstraintName}""
+                FOREIGN KEY (""{fk.ForeignKeyColumn}"")
+                REFERENCES ""{fk.PrimaryKeySchema}"".""{fk.PrimaryKeyTable}"" (""{fk.PrimaryKeyColumn}"")
+                ON DELETE CASCADE;
+            ";
+
+                    using (var pgCommand = new NpgsqlCommand(alterTableScript, pgConn))
+                    {
+                        await pgCommand.ExecuteNonQueryAsync();
+                    }
+
+                    Console.WriteLine($"Yabancı anahtar oluşturuldu: {fk.ConstraintName}");
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"Yabancı anahtar oluşturulurken hata oluştu: {fk.ConstraintName}. Hata: {ex.Message}");
+                }
+            }
+        }
+
+
+
 
         private async Task CreateSchemaIfNotExists(string schemaName, NpgsqlConnection pgConn)
         {
@@ -131,24 +252,33 @@ namespace DbMigrator
             // SQL Server'dan CSV dosyasına veri aktar
             try
             {
-                using (var writer = new StreamWriter(tempFile))
+                using (var writer = new StreamWriter(tempFile, false, Encoding.UTF8))
+                using (var csv = new CsvWriter(writer, CultureInfo.InvariantCulture))
                 {
                     var sqlCommand = new SqlCommand($"SELECT * FROM [{table.Schema}].[{table.Name}]", sqlConn);
                     using (var reader = await sqlCommand.ExecuteReaderAsync())
                     {
+                        // Sütun başlıklarını yaz
+                        for (int i = 0; i < reader.FieldCount; i++)
+                        {
+                            csv.WriteField(reader.GetName(i));
+                        }
+                        await csv.NextRecordAsync();
+
                         while (await reader.ReadAsync())
                         {
-                            var values = new List<string>();
                             for (int i = 0; i < reader.FieldCount; i++)
                             {
-                                var value = reader.IsDBNull(i) ? "NULL" :
-                                     (reader.GetFieldType(i) == typeof(DateTime) ? $"'{((DateTime)reader.GetValue(i)).ToString("yyyy-MM-dd HH:mm:ss")}'" :
-                                     (reader.GetFieldType(i) == typeof(decimal) || reader.GetFieldType(i) == typeof(double) || reader.GetFieldType(i) == typeof(float) ?
-                                     reader.GetValue(i).ToString().Replace(',', '.') :
-                                     $"'{reader.GetValue(i).ToString().Replace("'", "''")}'"));
-                                values.Add(value);
+                                if (reader.IsDBNull(i))
+                                {
+                                    csv.WriteField(string.Empty);
+                                }
+                                else
+                                {
+                                    csv.WriteField(reader.GetValue(i));
+                                }
                             }
-                            writer.WriteLine(string.Join(",", values));
+                            await csv.NextRecordAsync();
                         }
                     }
                 }
@@ -162,17 +292,23 @@ namespace DbMigrator
             // PostgreSQL'e COPY komutuyla CSV dosyasından veri aktar
             try
             {
-                var copyCommand = $"COPY \"{table.Schema}\".\"{table.Name}\" FROM '{tempFile}' DELIMITER ',' CSV HEADER";
-                using (var pgCommand = new NpgsqlCommand(copyCommand, pgConn))
+                var copyCommand = $"COPY \"{table.Schema}\".\"{table.Name}\" FROM STDIN (FORMAT csv, HEADER true)";
+                using (var pgWriter = pgConn.BeginTextImport(copyCommand))
+                using (var reader = new StreamReader(tempFile))
                 {
-                    await pgCommand.ExecuteNonQueryAsync();
-                    Console.WriteLine($"Veriler COPY komutuyla aktarıldı: {table.Schema}.{table.Name}");
+                    string line;
+                    while ((line = await reader.ReadLineAsync()) != null)
+                    {
+                        await pgWriter.WriteLineAsync(line);
+                    }
                 }
+                Console.WriteLine($"Veriler COPY komutuyla aktarıldı: {table.Schema}.{table.Name}");
             }
             catch (Exception ex)
             {
                 Console.WriteLine($"COPY komutuyla aktarım sırasında hata oluştu: {ex.Message}");
             }
+
         }
 
         private async Task RetryFailedTables(SqlConnection sqlConn, NpgsqlConnection pgConn)
@@ -203,6 +339,7 @@ namespace DbMigrator
                 case "nchar":
                 case "text":
                 case "ntext":
+                case "hierarchyid":
                     return "text";
                 case "char":
                     return "char";
@@ -235,8 +372,12 @@ namespace DbMigrator
                     return "bytea";
                 case "money":
                     return "numeric(19,4)";
+                case "smallmoney":
+                    return "numeric(10,4)";
                 case "xml":
                     return "xml";
+                case "geography":
+                    return "geography";
                 default:
                     throw new Exception($"Unsupported SQL Server data type: {sqlType}");
             }

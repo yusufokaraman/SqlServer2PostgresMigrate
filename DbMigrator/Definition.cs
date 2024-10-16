@@ -18,5 +18,18 @@ namespace DbMigrator
         public string Name { get; set; }
         public string SqlDataType { get; set; }
         public bool IsNullable { get; set; }
+        public bool IsPrimaryKey { get; set; }
     }
+
+    public class ForeignKeyDefinition
+    {
+        public string ConstraintName { get; set; }
+        public string ForeignKeySchema { get; set; }
+        public string ForeignKeyTable { get; set; }
+        public string ForeignKeyColumn { get; set; }
+        public string PrimaryKeySchema { get; set; }
+        public string PrimaryKeyTable { get; set; }
+        public string PrimaryKeyColumn { get; set; }
+    }
+
 }
