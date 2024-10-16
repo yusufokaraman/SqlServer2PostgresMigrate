@@ -200,33 +200,84 @@ namespace DbMigrator
         {
             var foreignKeys = await GetForeignKeyDefinitions(sqlConn);
 
-            foreach (var fk in foreignKeys)
+            var pendingForeignKeys = new Queue<ForeignKeyDefinition>(foreignKeys);
+            var failedForeignKeys = new List<ForeignKeyDefinition>();
+            var attemptCounts = new Dictionary<string, int>();
+
+            int maxAttempts = 3;
+
+            while (pendingForeignKeys.Count > 0)
             {
-                try
+                int count = pendingForeignKeys.Count;
+                bool progressMade = false;
+
+                for (int i = 0; i < count; i++)
                 {
-                    var alterTableScript = $@"
+                    var fk = pendingForeignKeys.Dequeue();
+
+                    if (!attemptCounts.ContainsKey(fk.ConstraintName))
+                    {
+                        attemptCounts[fk.ConstraintName] = 1;
+                    }
+                    else
+                    {
+                        attemptCounts[fk.ConstraintName]++;
+                    }
+
+                    try
+                    {
+                        var alterTableScript = $@"
                 ALTER TABLE ""{fk.ForeignKeySchema}"".""{fk.ForeignKeyTable}""
                 ADD CONSTRAINT ""{fk.ConstraintName}""
                 FOREIGN KEY (""{fk.ForeignKeyColumn}"")
                 REFERENCES ""{fk.PrimaryKeySchema}"".""{fk.PrimaryKeyTable}"" (""{fk.PrimaryKeyColumn}"")
                 ON DELETE CASCADE;
-            ";
+                ";
 
-                    using (var pgCommand = new NpgsqlCommand(alterTableScript, pgConn))
-                    {
-                        await pgCommand.ExecuteNonQueryAsync();
+                        using (var pgCommand = new NpgsqlCommand(alterTableScript, pgConn))
+                        {
+                            await pgCommand.ExecuteNonQueryAsync();
+                        }
+
+                        Console.WriteLine($"Yabancı anahtar oluşturuldu: {fk.ConstraintName}");
+                        progressMade = true;
                     }
+                    catch (Exception ex)
+                    {
+                        Console.WriteLine($"Yabancı anahtar oluşturulurken hata oluştu: {fk.ConstraintName}. Deneme {attemptCounts[fk.ConstraintName]} / {maxAttempts}. Hata: {ex.Message}");
 
-                    Console.WriteLine($"Yabancı anahtar oluşturuldu: {fk.ConstraintName}");
+                        if (attemptCounts[fk.ConstraintName] < maxAttempts)
+                        {
+                            pendingForeignKeys.Enqueue(fk);
+                        }
+                        else
+                        {
+                            failedForeignKeys.Add(fk);
+                            Console.WriteLine($"Yabancı anahtar oluşturma denemeleri başarısız oldu: {fk.ConstraintName}");
+                        }
+                    }
                 }
-                catch (Exception ex)
+
+                if (!progressMade)
                 {
-                    Console.WriteLine($"Yabancı anahtar oluşturulurken hata oluştu: {fk.ConstraintName}. Hata: {ex.Message}");
+                    // İlerleme yok, sonsuz döngüyü önlemek için kırıyoruz
+                    break;
                 }
             }
+
+            if (failedForeignKeys.Count > 0)
+            {
+                Console.WriteLine("Aşağıdaki yabancı anahtarlar oluşturulamadı:");
+                foreach (var fk in failedForeignKeys)
+                {
+                    Console.WriteLine($"- {fk.ConstraintName}");
+                }
+            }
+            else
+            {
+                Console.WriteLine("Tüm yabancı anahtarlar başarıyla oluşturuldu.");
+            }
         }
-
-
 
 
         private async Task CreateSchemaIfNotExists(string schemaName, NpgsqlConnection pgConn)
@@ -286,6 +337,7 @@ namespace DbMigrator
             catch (Exception ex)
             {
                 Console.WriteLine($"CSV dosyası oluşturulurken hata oluştu: {ex.Message}");
+                Console.WriteLine($"Hata Detayı: {ex}");
                 return;
             }
 
