@@ -5,7 +5,11 @@ VisualStudioVersion = 17.9.34622.214
 MinimumVisualStudioVersion = 10.0.40219.1
 Project("{9A19103F-16F7-4668-BE54-9A1E7A4F7556}") = "DataMigrate2Postgres", "DataMigrate2Postgres\DataMigrate2Postgres.csproj", "{2D7DCAC3-B25D-413B-B278-E84D026664DA}"
 EndProject
-Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "ConsoleApp", "ConsoleApp\ConsoleApp.csproj", "{9C63FA70-6638-453C-9868-DCE12E879709}"
+Project("{9A19103F-16F7-4668-BE54-9A1E7A4F7556}") = "ConsoleApp", "ConsoleApp\ConsoleApp.csproj", "{9C63FA70-6638-453C-9868-DCE12E879709}"
+EndProject
+Project("{9A19103F-16F7-4668-BE54-9A1E7A4F7556}") = "DbMigrator", "DbMigrator\DbMigrator.csproj", "{68BF514B-37C6-47CF-8552-98CFC2AF365E}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "PostgresToSqlServer", "PostgresToSqlServer\PostgresToSqlServer.csproj", "{20886CC6-3643-40DF-A0F6-F311B27850CA}"
 EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
@@ -21,6 +25,14 @@ Global
 		{9C63FA70-6638-453C-9868-DCE12E879709}.Debug|Any CPU.Build.0 = Debug|Any CPU
 		{9C63FA70-6638-453C-9868-DCE12E879709}.Release|Any CPU.ActiveCfg = Release|Any CPU
 		{9C63FA70-6638-453C-9868-DCE12E879709}.Release|Any CPU.Build.0 = Release|Any CPU
+		{68BF514B-37C6-47CF-8552-98CFC2AF365E}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{68BF514B-37C6-47CF-8552-98CFC2AF365E}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{68BF514B-37C6-47CF-8552-98CFC2AF365E}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{68BF514B-37C6-47CF-8552-98CFC2AF365E}.Release|Any CPU.Build.0 = Release|Any CPU
+		{20886CC6-3643-40DF-A0F6-F311B27850CA}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{20886CC6-3643-40DF-A0F6-F311B27850CA}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{20886CC6-3643-40DF-A0F6-F311B27850CA}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{20886CC6-3643-40DF-A0F6-F311B27850CA}.Release|Any CPU.Build.0 = Release|Any CPU
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE
