@@ -1,10 +1,8 @@
-﻿using Npgsql;
-using System;
-using System.Collections.Generic;
+﻿using CsvHelper;
+using Npgsql;
 using System.Data.SqlClient;
-using System.Linq;
+using System.Globalization;
 using System.Text;
-using System.Threading.Tasks;
 
 namespace PostgresToSqlServer
 {
@@ -24,12 +22,7 @@ namespace PostgresToSqlServer
                 {
                     try
                     {
-                        // "public" şemasını "dbo" olarak değiştir
-                        if (table.Schema == "public")
-                            table.Schema = "dbo";
-
-                        await EnsureConnectionOpen(sqlConn);  // Bağlantıyı kontrol et
-                        await CreateSchemaIfNotExists(table.Schema, sqlConn);  // Şemayı oluştur
+                        await CreateSchemaIfNotExists(table.Schema, sqlConn);
 
                         var createTableScript = GenerateCreateTableScript(table);
                         using (var sqlCommand = new SqlCommand(createTableScript, sqlConn))
@@ -53,10 +46,11 @@ namespace PostgresToSqlServer
 
                 Console.WriteLine("Veritabanı aktarımı tamamlandı.");
 
-                // Tablolar arası ilişkileri aktar
-                await MigrateConstraints(pgConn, sqlConn);
-
                 await RetryFailedTables(pgConn, sqlConn);
+
+                await MigrateForeignKeysAsync(pgConn, sqlConn);
+
+                Console.WriteLine("Yabancı anahtarlar başarıyla aktarıldı.");
             }
             catch (Exception ex)
             {
@@ -64,34 +58,22 @@ namespace PostgresToSqlServer
             }
         }
 
-        private async Task EnsureConnectionOpen(SqlConnection sqlConn)
-        {
-            if (sqlConn.State != System.Data.ConnectionState.Open)
-            {
-                await sqlConn.OpenAsync();
-                Console.WriteLine("Bağlantı yeniden açıldı.");
-            }
-        }
-
         private async Task<List<TableDefinition>> GetTableDefinitions(NpgsqlConnection pgConn)
         {
             var tables = new List<TableDefinition>();
             var query = @"
-                SELECT 
-                    table_name, 
-                    table_schema, 
-                    column_name, 
-                    data_type, 
-                    is_nullable,
-                    ordinal_position
-                FROM 
-                    information_schema.columns 
-                WHERE 
-                    table_schema NOT IN ('information_schema', 'pg_catalog')
-                ORDER BY 
-                    table_schema, 
-                    table_name, 
-                    ordinal_position";
+        SELECT 
+            table_schema,
+            table_name,
+            column_name,
+            data_type,
+            is_nullable,
+            ordinal_position,
+            column_default
+        FROM information_schema.columns
+        WHERE table_schema NOT IN ('information_schema', 'pg_catalog')
+        ORDER BY table_schema, table_name, ordinal_position;
+    ";
 
             using (var command = new NpgsqlCommand(query, pgConn))
             using (var reader = await command.ExecuteReaderAsync())
@@ -100,50 +82,189 @@ namespace PostgresToSqlServer
                 {
                     var tableName = reader["table_name"].ToString();
                     var tableSchema = reader["table_schema"].ToString();
+
+                    // PostgreSQL'deki 'public' şemasını SQL Server'da 'dbo' şemasına eşliyoruz
+                    if (tableSchema == "public") tableSchema = "dbo";
+
                     var columnName = reader["column_name"].ToString();
                     var dataType = reader["data_type"].ToString();
                     var isNullable = reader["is_nullable"].ToString() == "YES";
 
-                    var table = tables.Find(t => t.Name == tableName && t.Schema == tableSchema);
+                    var table = tables.FirstOrDefault(t => t.Name == tableName && t.Schema == tableSchema);
                     if (table == null)
                     {
                         table = new TableDefinition { Name = tableName, Schema = tableSchema };
                         tables.Add(table);
                     }
-                    table.Columns.Add(new ColumnDefinition { Name = columnName, SqlDataType = dataType, IsNullable = isNullable });
+
+                    table.Columns.Add(new ColumnDefinition
+                    {
+                        Name = columnName,
+                        PgDataType = dataType,
+                        IsNullable = isNullable,
+                    });
+                }
+            }
+
+            // Birincil anahtarları almak için ek sorgu
+            var pkQuery = @"
+        SELECT
+            kc.table_schema,
+            kc.table_name,
+            kc.column_name,
+            kc.ordinal_position
+        FROM information_schema.table_constraints tc
+        JOIN information_schema.key_column_usage kc
+            ON kc.table_name = tc.table_name
+            AND kc.table_schema = tc.table_schema
+            AND kc.constraint_name = tc.constraint_name
+        WHERE tc.constraint_type = 'PRIMARY KEY';
+    ";
+
+            using (var command = new NpgsqlCommand(pkQuery, pgConn))
+            using (var reader = await command.ExecuteReaderAsync())
+            {
+                while (await reader.ReadAsync())
+                {
+                    var tableName = reader["table_name"].ToString();
+                    var tableSchema = reader["table_schema"].ToString();
+
+                    // Şema eşleme
+                    if (tableSchema == "public") tableSchema = "dbo";
+
+                    var columnName = reader["column_name"].ToString();
+
+                    var table = tables.FirstOrDefault(t => t.Name == tableName && t.Schema == tableSchema);
+                    if (table != null)
+                    {
+                        var column = table.Columns.FirstOrDefault(c => c.Name == columnName);
+                        if (column != null)
+                        {
+                            column.IsPrimaryKey = true;
+                            column.PrimaryKeyOrdinal = Convert.ToInt32(reader["ordinal_position"]);
+                        }
+                    }
                 }
             }
 
             return tables;
         }
 
+
         private string GenerateCreateTableScript(TableDefinition table)
         {
             var sb = new StringBuilder();
-
-            sb.AppendLine($"IF NOT EXISTS (SELECT * FROM sys.schemas WHERE name = '{table.Schema}')");
-            sb.AppendLine($"EXEC('CREATE SCHEMA [{table.Schema}]');");
-
-            sb.AppendLine($"IF OBJECT_ID('[{table.Schema}].[{table.Name}]', 'U') IS NULL");
+            //sb.AppendLine($"CREATE SCHEMA IF NOT EXISTS [{table.Schema}];");
             sb.AppendLine($"CREATE TABLE [{table.Schema}].[{table.Name}] (");
 
-            for (int i = 0; i < table.Columns.Count; i++)
+            var columnDefinitions = table.Columns.Select(column =>
+                $"[{column.Name}] {GetSqlServerDataType(column.PgDataType)} {(column.IsNullable ? "NULL" : "NOT NULL")}");
+
+            var columnsAndConstraints = new List<string>();
+            columnsAndConstraints.AddRange(columnDefinitions);
+
+            if (table.Columns.Any(c => c.IsPrimaryKey))
             {
-                var column = table.Columns[i];
-                var isLastColumn = i == table.Columns.Count - 1;
-                sb.Append($"[{column.Name}] {GetSqlServerDataType(column.SqlDataType)} {(column.IsNullable ? "NULL" : "NOT NULL")}");
-                if (!isLastColumn)
-                    sb.AppendLine(",");
-                else
-                    sb.AppendLine();
+                var primaryKeyColumns = table.Columns
+                    .Where(c => c.IsPrimaryKey)
+                    .OrderBy(c => c.PrimaryKeyOrdinal)
+                    .Select(c => $"[{c.Name}]");
+                columnsAndConstraints.Add($"PRIMARY KEY ({string.Join(", ", primaryKeyColumns)})");
             }
+
+            sb.AppendLine(string.Join(",\n", columnsAndConstraints));
 
             sb.AppendLine(");");
             return sb.ToString();
         }
 
+        private async Task<List<ForeignKeyDefinition>> GetForeignKeyDefinitions(NpgsqlConnection pgConn)
+        {
+            var foreignKeys = new List<ForeignKeyDefinition>();
+            var query = @"
+        SELECT
+            tc.constraint_name AS constraint_name,
+            kcu.table_schema AS fk_schema,
+            kcu.table_name AS fk_table,
+            kcu.column_name AS fk_column,
+            ccu.table_schema AS pk_schema,
+            ccu.table_name AS pk_table,
+            ccu.column_name AS pk_column
+        FROM 
+            information_schema.table_constraints AS tc 
+            JOIN information_schema.key_column_usage AS kcu
+              ON tc.constraint_name = kcu.constraint_name
+              AND tc.table_schema = kcu.table_schema
+            JOIN information_schema.constraint_column_usage AS ccu
+              ON ccu.constraint_name = tc.constraint_name
+              AND ccu.table_schema = tc.table_schema
+        WHERE tc.constraint_type = 'FOREIGN KEY';
+    ";
+
+            using (var command = new NpgsqlCommand(query, pgConn))
+            using (var reader = await command.ExecuteReaderAsync())
+            {
+                while (await reader.ReadAsync())
+                {
+                    var fkSchema = reader["fk_schema"].ToString();
+                    var pkSchema = reader["pk_schema"].ToString();
+
+                    // Şema eşleme
+                    if (fkSchema == "public") fkSchema = "dbo";
+                    if (pkSchema == "public") pkSchema = "dbo";
+
+                    foreignKeys.Add(new ForeignKeyDefinition
+                    {
+                        ConstraintName = reader["constraint_name"].ToString(),
+                        ForeignKeySchema = fkSchema,
+                        ForeignKeyTable = reader["fk_table"].ToString(),
+                        ForeignKeyColumn = reader["fk_column"].ToString(),
+                        PrimaryKeySchema = pkSchema,
+                        PrimaryKeyTable = reader["pk_table"].ToString(),
+                        PrimaryKeyColumn = reader["pk_column"].ToString()
+                    });
+                }
+            }
+
+            return foreignKeys;
+        }
+
+
+        public async Task MigrateForeignKeysAsync(NpgsqlConnection pgConn, SqlConnection sqlConn)
+        {
+            var foreignKeys = await GetForeignKeyDefinitions(pgConn);
+
+            foreach (var fk in foreignKeys)
+            {
+                try
+                {
+                    var alterTableScript = $@"
+                        ALTER TABLE [{fk.ForeignKeySchema}].[{fk.ForeignKeyTable}]
+                        ADD CONSTRAINT [{fk.ConstraintName}]
+                        FOREIGN KEY ([{fk.ForeignKeyColumn}])
+                        REFERENCES [{fk.PrimaryKeySchema}].[{fk.PrimaryKeyTable}] ([{fk.PrimaryKeyColumn}])
+                        ON DELETE CASCADE;
+                    ";
+
+                    using (var sqlCommand = new SqlCommand(alterTableScript, sqlConn))
+                    {
+                        await sqlCommand.ExecuteNonQueryAsync();
+                    }
+
+                    Console.WriteLine($"Yabancı anahtar oluşturuldu: {fk.ConstraintName}");
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"Yabancı anahtar oluşturulurken hata oluştu: {fk.ConstraintName}. Hata: {ex.Message}");
+                }
+            }
+        }
+
         private async Task CreateSchemaIfNotExists(string schemaName, SqlConnection sqlConn)
         {
+            if (schemaName == "dbo")
+                return;
+
             var createSchemaCommand = $"IF NOT EXISTS (SELECT * FROM sys.schemas WHERE name = '{schemaName}') EXEC('CREATE SCHEMA [{schemaName}]')";
             using (var sqlCommand = new SqlCommand(createSchemaCommand, sqlConn))
             {
@@ -152,94 +273,39 @@ namespace PostgresToSqlServer
             }
         }
 
+
         private async Task BatchMigrateData(TableDefinition table, NpgsqlConnection pgConn, SqlConnection sqlConn)
         {
             try
             {
-                var query = $"SELECT * FROM \"{(table.Schema == "dbo" ? "public" : table.Schema)}\".\"{table.Name}\"";
-                var pgCommand = new NpgsqlCommand(query, pgConn);
+                // PostgreSQL'de şema adını kontrol ediyoruz
+                var pgSchema = table.Schema == "dbo" ? "public" : table.Schema;
+                var pgCommand = new NpgsqlCommand($"SELECT * FROM \"{pgSchema}\".\"{table.Name}\"", pgConn);
 
                 using (var reader = await pgCommand.ExecuteReaderAsync())
                 {
-                    var dataTable = new System.Data.DataTable();
-
-                    // Verileri DataTable'a yükle
-                    dataTable.Load(reader);
-
-                    // DataTable'daki sütun veri tiplerini SQL Server ile uyumlu hale getir
-                    foreach (System.Data.DataColumn column in dataTable.Columns)
-                    {
-                        var columnDef = table.Columns.First(c => c.Name == column.ColumnName);
-                        var sqlServerDataType = GetSqlServerDataType(columnDef.SqlDataType);
-                        var netType = GetDotNetType(sqlServerDataType);
-
-                        if (column.DataType != netType)
-                        {
-                            column.DataType = netType;
-                        }
-                    }
-
                     using (var bulkCopy = new SqlBulkCopy(sqlConn))
                     {
                         bulkCopy.DestinationTableName = $"[{table.Schema}].[{table.Name}]";
 
-                        // Sütun eşlemelerini ayarla
-                        foreach (System.Data.DataColumn column in dataTable.Columns)
+                        // Sütun eşlemeleri
+                        foreach (var column in table.Columns)
                         {
-                            bulkCopy.ColumnMappings.Add(column.ColumnName, column.ColumnName);
+                            bulkCopy.ColumnMappings.Add(column.Name, column.Name);
                         }
 
-                        await bulkCopy.WriteToServerAsync(dataTable);
+                        await bulkCopy.WriteToServerAsync(reader);
                     }
                 }
-                Console.WriteLine($"Veriler başarıyla aktarıldı: {table.Schema}.{table.Name}");
+
+                Console.WriteLine($"Veriler SqlBulkCopy ile aktarıldı: {table.Schema}.{table.Name}");
             }
             catch (Exception ex)
             {
                 Console.WriteLine($"Veri aktarımı sırasında hata oluştu: {ex.Message}");
-                throw;
             }
         }
 
-        private Type GetDotNetType(string sqlServerDataType)
-        {
-            switch (sqlServerDataType)
-            {
-                case "int":
-                    return typeof(int);
-                case "bigint":
-                    return typeof(long);
-                case "smallint":
-                    return typeof(short);
-                case "bit":
-                    return typeof(bool);
-                case "decimal":
-                case "numeric":
-                    return typeof(decimal);
-                case "float":
-                    return typeof(double);
-                case "real":
-                    return typeof(float);
-                case "datetime":
-                case "date":
-                case "time":
-                    return typeof(DateTime);
-                case "uniqueidentifier":
-                    return typeof(Guid);
-                case "nvarchar(max)":
-                case "nvarchar":
-                case "nchar":
-                case "varchar":
-                case "char":
-                case "text":
-                    return typeof(string);
-                case "varbinary":
-                case "varbinary(max)":
-                    return typeof(byte[]);
-                default:
-                    return typeof(string); // Varsayılan olarak string al
-            }
-        }
 
         private async Task RetryFailedTables(NpgsqlConnection pgConn, SqlConnection sqlConn)
         {
@@ -249,7 +315,6 @@ namespace PostgresToSqlServer
                 try
                 {
                     Console.WriteLine($"Hatalı tabloyu tekrar aktarıyor: {table.Schema}.{table.Name}");
-                    await EnsureConnectionOpen(sqlConn);
                     await BatchMigrateData(table, pgConn, sqlConn);
                     Console.WriteLine($"Tablo başarıyla aktarıldı: {table.Schema}.{table.Name}");
                 }
@@ -264,181 +329,55 @@ namespace PostgresToSqlServer
         {
             switch (pgType)
             {
-                case "character varying":
-                case "varchar":
-                case "text":
-                    return "nvarchar(max)";
-                case "character":
-                case "char":
-                    return "nchar(1)";
-                case "uuid":
-                    return "uniqueidentifier";
+                case "integer":
+                    return "INT";
+                case "bigint":
+                    return "BIGINT";
+                case "smallint":
+                    return "SMALLINT";
+                case "serial":
+                    return "INT IDENTITY(1,1)";
+                case "bigserial":
+                    return "BIGINT IDENTITY(1,1)";
+                case "boolean":
+                    return "BIT";
                 case "timestamp without time zone":
                 case "timestamp with time zone":
                 case "timestamp":
-                    return "datetime";
+                    return "DATETIME";
                 case "date":
-                    return "date";
+                    return "DATE";
+                case "time":
                 case "time without time zone":
                 case "time with time zone":
-                case "time":
-                    return "time";
-                case "boolean":
-                    return "bit";
-                case "numeric":
-                    return "decimal(18,4)";
-                case "decimal":
-                    return "decimal(18,4)";
-                case "integer":
-                    return "int";
-                case "bigint":
-                    return "bigint";
-                case "double precision":
-                    return "float";
-                case "real":
-                    return "real";
-                case "smallint":
-                    return "smallint";
+                    return "TIME";
+                case "text":
+                case "character varying":
+                case "varchar":
+                    return "NVARCHAR(MAX)";
+                case "character":
+                case "char":
+                    return "NVARCHAR(255)";
+                case "uuid":
+                    return "UNIQUEIDENTIFIER";
                 case "bytea":
-                    return "varbinary(max)";
+                    return "VARBINARY(MAX)";
+                case "numeric":
+                    return "DECIMAL";
+                case "real":
+                    return "REAL";
+                case "double precision":
+                    return "FLOAT";
+                case "USER-DEFINED":
+                case "json":
+                case "jsonb":
+                case "ARRAY":
+                case "hstore":
+                case "tsvector":
+                    return "NVARCHAR(MAX)";
                 default:
-                    return "nvarchar(max)"; // Varsayılan olarak nvarchar(max)
+                    throw new Exception($"Unsupported PostgreSQL data type: {pgType}");
             }
         }
-
-
-        private async Task MigrateConstraints(NpgsqlConnection pgConn, SqlConnection sqlConn)
-        {
-            // Önce tüm tabloların birincil anahtarlarını aktaralım
-            await MigratePrimaryKeys(pgConn, sqlConn);
-
-            // Ardından yabancı anahtarları aktaralım
-            await MigrateForeignKeys(pgConn, sqlConn);
-        }
-
-        private async Task MigratePrimaryKeys(NpgsqlConnection pgConn, SqlConnection sqlConn)
-        {
-            var query = @"
-                SELECT
-                    kcu.table_schema,
-                    kcu.table_name,
-                    tco.constraint_name,
-                    kcu.column_name
-                FROM
-                    information_schema.table_constraints tco
-                JOIN information_schema.key_column_usage kcu 
-                    ON kcu.constraint_name = tco.constraint_name
-                    AND kcu.constraint_schema = tco.constraint_schema
-                    AND kcu.constraint_name = tco.constraint_name
-                WHERE tco.constraint_type = 'PRIMARY KEY'
-                ORDER BY kcu.table_schema, kcu.table_name, tco.constraint_name, kcu.ordinal_position";
-
-            var primaryKeys = new Dictionary<string, List<string>>();
-
-            using (var command = new NpgsqlCommand(query, pgConn))
-            using (var reader = await command.ExecuteReaderAsync())
-            {
-                while (await reader.ReadAsync())
-                {
-                    var tableSchema = reader["table_schema"].ToString();
-                    var tableName = reader["table_name"].ToString();
-                    var constraintName = reader["constraint_name"].ToString();
-                    var columnName = reader["column_name"].ToString();
-
-                    // "public" şemasını "dbo" olarak değiştir
-                    if (tableSchema == "public")
-                        tableSchema = "dbo";
-
-                    var key = $"{tableSchema}.{tableName}.{constraintName}";
-                    if (!primaryKeys.ContainsKey(key))
-                    {
-                        primaryKeys[key] = new List<string>();
-                    }
-                    primaryKeys[key].Add(columnName);
-                }
-            }
-
-            foreach (var pk in primaryKeys)
-            {
-                var parts = pk.Key.Split('.');
-                var schema = parts[0];
-                var table = parts[1];
-                var constraint = parts[2];
-
-                var columns = pk.Value.Select(c => $"[{c}]");
-                var constraintScript = $@"
-                    ALTER TABLE [{schema}].[{table}]
-                    ADD CONSTRAINT [{constraint}]
-                    PRIMARY KEY ({string.Join(", ", columns)});";
-
-                using (var command = new SqlCommand(constraintScript, sqlConn))
-                {
-                    await command.ExecuteNonQueryAsync();
-                    Console.WriteLine($"Birincil anahtar oluşturuldu: {schema}.{table} - {constraint}");
-                }
-            }
-        }
-
-        private async Task MigrateForeignKeys(NpgsqlConnection pgConn, SqlConnection sqlConn)
-        {
-            var query = @"
-                SELECT
-                    tc.constraint_name,
-                    tc.table_schema,
-                    tc.table_name,
-                    kcu.column_name,
-                    ccu.table_schema AS foreign_table_schema,
-                    ccu.table_name AS foreign_table_name,
-                    ccu.column_name AS foreign_column_name
-                FROM 
-                    information_schema.table_constraints AS tc 
-                JOIN information_schema.key_column_usage AS kcu
-                    ON tc.constraint_name = kcu.constraint_name
-                    AND tc.table_schema = kcu.table_schema
-                JOIN information_schema.constraint_column_usage AS ccu
-                    ON ccu.constraint_name = tc.constraint_name
-                    AND ccu.table_schema = tc.table_schema
-                WHERE tc.constraint_type = 'FOREIGN KEY'";
-
-            using (var command = new NpgsqlCommand(query, pgConn))
-            using (var reader = await command.ExecuteReaderAsync())
-            {
-                while (await reader.ReadAsync())
-                {
-                    var constraintName = reader["constraint_name"].ToString();
-                    var tableSchema = reader["table_schema"].ToString();
-                    var tableName = reader["table_name"].ToString();
-                    var columnName = reader["column_name"].ToString();
-                    var foreignTableSchema = reader["foreign_table_schema"].ToString();
-                    var foreignTableName = reader["foreign_table_name"].ToString();
-                    var foreignColumnName = reader["foreign_column_name"].ToString();
-
-                    // "public" şemasını "dbo" olarak değiştir
-                    if (tableSchema == "public")
-                        tableSchema = "dbo";
-                    if (foreignTableSchema == "public")
-                        foreignTableSchema = "dbo";
-
-                    var constraintScript = $@"
-                        ALTER TABLE [{tableSchema}].[{tableName}]
-                        ADD CONSTRAINT [{constraintName}]
-                        FOREIGN KEY ([{columnName}])
-                        REFERENCES [{foreignTableSchema}].[{foreignTableName}]([{foreignColumnName}]);";
-
-                    using (var sqlCommand = new SqlCommand(constraintScript, sqlConn))
-                    {
-                        try
-                        {
-                            await sqlCommand.ExecuteNonQueryAsync();
-                            Console.WriteLine($"Yabancı anahtar oluşturuldu: {constraintName}");
-                        }
-                        catch (Exception ex)
-                        {
-                            Console.WriteLine($"Yabancı anahtar oluşturulurken hata oluştu: {constraintName}. Hata: {ex.Message}");
-                        }
-                    }
-                }
-            }
-        }
-    }
+    }  
 }
