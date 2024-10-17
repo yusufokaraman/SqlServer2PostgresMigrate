@@ -22,8 +22,8 @@ namespace DbMigrator
                 {
                     try
                     {
-                        await EnsureConnectionOpen(pgConn);  // Bağlantıyı kontrol et
-                        await CreateSchemaIfNotExists(table.Schema, pgConn);  // Şemayı oluştur
+                        await EnsureConnectionOpen(pgConn);
+                        await CreateSchemaIfNotExists(table.Schema, pgConn);
 
                         var createTableScript = GenerateCreateTableScript(table);
                         using (var pgCommand = new NpgsqlCommand(createTableScript, pgConn))
@@ -47,10 +47,8 @@ namespace DbMigrator
 
                 Console.WriteLine("Veritabanı aktarımı tamamlandı.");
 
-                // Hatalı tabloları tekrar dene
                 await RetryFailedTables(sqlConn, pgConn);
 
-                // Yabancı anahtarları aktarma
                 await MigrateForeignKeysAsync(sqlConn, pgConn);
 
                 Console.WriteLine("Yabancı anahtarlar başarıyla aktarıldı.");
@@ -75,28 +73,28 @@ namespace DbMigrator
         {
             var tables = new List<TableDefinition>();
             var query = @"
-        SELECT 
-            tc.TABLE_NAME, 
-            tc.TABLE_SCHEMA,
-            c.COLUMN_NAME,
-            c.DATA_TYPE,
-            c.IS_NULLABLE,
-            CASE WHEN pk.COLUMN_NAME IS NOT NULL THEN 1 ELSE 0 END AS IS_PRIMARY_KEY
-        FROM INFORMATION_SCHEMA.COLUMNS c
-        INNER JOIN INFORMATION_SCHEMA.TABLES tc ON c.TABLE_NAME = tc.TABLE_NAME AND c.TABLE_SCHEMA = tc.TABLE_SCHEMA
-        LEFT JOIN (
-            SELECT ku.TABLE_CATALOG,ku.TABLE_SCHEMA,ku.TABLE_NAME,ku.COLUMN_NAME
-            FROM INFORMATION_SCHEMA.TABLE_CONSTRAINTS AS tc
-            INNER JOIN INFORMATION_SCHEMA.KEY_COLUMN_USAGE AS ku
-                ON tc.CONSTRAINT_TYPE = 'PRIMARY KEY' 
-                AND tc.CONSTRAINT_NAME = ku.CONSTRAINT_NAME
-        ) pk 
-            ON c.TABLE_CATALOG = pk.TABLE_CATALOG 
-            AND c.TABLE_SCHEMA = pk.TABLE_SCHEMA 
-            AND c.TABLE_NAME = pk.TABLE_NAME 
-            AND c.COLUMN_NAME = pk.COLUMN_NAME
-        WHERE tc.TABLE_TYPE = 'BASE TABLE';
-    ";
+                SELECT 
+                    tc.TABLE_NAME, 
+                    tc.TABLE_SCHEMA,
+                    c.COLUMN_NAME,
+                    c.DATA_TYPE,
+                    c.IS_NULLABLE,
+                    CASE WHEN pk.COLUMN_NAME IS NOT NULL THEN 1 ELSE 0 END AS IS_PRIMARY_KEY
+                FROM INFORMATION_SCHEMA.COLUMNS c
+                INNER JOIN INFORMATION_SCHEMA.TABLES tc ON c.TABLE_NAME = tc.TABLE_NAME AND c.TABLE_SCHEMA = tc.TABLE_SCHEMA
+                LEFT JOIN (
+                    SELECT ku.TABLE_CATALOG,ku.TABLE_SCHEMA,ku.TABLE_NAME,ku.COLUMN_NAME
+                    FROM INFORMATION_SCHEMA.TABLE_CONSTRAINTS AS tc
+                    INNER JOIN INFORMATION_SCHEMA.KEY_COLUMN_USAGE AS ku
+                        ON tc.CONSTRAINT_TYPE = 'PRIMARY KEY' 
+                        AND tc.CONSTRAINT_NAME = ku.CONSTRAINT_NAME
+                ) pk 
+                    ON c.TABLE_CATALOG = pk.TABLE_CATALOG 
+                    AND c.TABLE_SCHEMA = pk.TABLE_SCHEMA 
+                    AND c.TABLE_NAME = pk.TABLE_NAME 
+                    AND c.COLUMN_NAME = pk.COLUMN_NAME
+                WHERE tc.TABLE_TYPE = 'BASE TABLE';
+            ";
 
             using (var command = new SqlCommand(query, sqlConn))
             using (var reader = await command.ExecuteReaderAsync())
@@ -159,21 +157,21 @@ namespace DbMigrator
         {
             var foreignKeys = new List<ForeignKeyDefinition>();
             var query = @"
-        SELECT 
-            fk.CONSTRAINT_NAME,
-            fk.TABLE_SCHEMA AS FK_SCHEMA,
-            fk.TABLE_NAME AS FK_TABLE,
-            kcu.COLUMN_NAME AS FK_COLUMN,
-            pk.TABLE_SCHEMA AS PK_SCHEMA,
-            pk.TABLE_NAME AS PK_TABLE,
-            kcu2.COLUMN_NAME AS PK_COLUMN
-        FROM INFORMATION_SCHEMA.REFERENTIAL_CONSTRAINTS rc
-        INNER JOIN INFORMATION_SCHEMA.TABLE_CONSTRAINTS fk ON rc.CONSTRAINT_NAME = fk.CONSTRAINT_NAME
-        INNER JOIN INFORMATION_SCHEMA.TABLE_CONSTRAINTS pk ON rc.UNIQUE_CONSTRAINT_NAME = pk.CONSTRAINT_NAME
-        INNER JOIN INFORMATION_SCHEMA.KEY_COLUMN_USAGE kcu ON fk.CONSTRAINT_NAME = kcu.CONSTRAINT_NAME
-        INNER JOIN INFORMATION_SCHEMA.KEY_COLUMN_USAGE kcu2 ON pk.CONSTRAINT_NAME = kcu2.CONSTRAINT_NAME AND kcu.ORDINAL_POSITION = kcu2.ORDINAL_POSITION
-        ORDER BY fk.TABLE_NAME, kcu.COLUMN_NAME;
-    ";
+                    SELECT 
+                        fk.CONSTRAINT_NAME,
+                        fk.TABLE_SCHEMA AS FK_SCHEMA,
+                        fk.TABLE_NAME AS FK_TABLE,
+                        kcu.COLUMN_NAME AS FK_COLUMN,
+                        pk.TABLE_SCHEMA AS PK_SCHEMA,
+                        pk.TABLE_NAME AS PK_TABLE,
+                        kcu2.COLUMN_NAME AS PK_COLUMN
+                    FROM INFORMATION_SCHEMA.REFERENTIAL_CONSTRAINTS rc
+                    INNER JOIN INFORMATION_SCHEMA.TABLE_CONSTRAINTS fk ON rc.CONSTRAINT_NAME = fk.CONSTRAINT_NAME
+                    INNER JOIN INFORMATION_SCHEMA.TABLE_CONSTRAINTS pk ON rc.UNIQUE_CONSTRAINT_NAME = pk.CONSTRAINT_NAME
+                    INNER JOIN INFORMATION_SCHEMA.KEY_COLUMN_USAGE kcu ON fk.CONSTRAINT_NAME = kcu.CONSTRAINT_NAME
+                    INNER JOIN INFORMATION_SCHEMA.KEY_COLUMN_USAGE kcu2 ON pk.CONSTRAINT_NAME = kcu2.CONSTRAINT_NAME AND kcu.ORDINAL_POSITION = kcu2.ORDINAL_POSITION
+                    ORDER BY fk.TABLE_NAME, kcu.COLUMN_NAME;
+                ";
 
             using (var command = new SqlCommand(query, sqlConn))
             using (var reader = await command.ExecuteReaderAsync())
@@ -227,12 +225,12 @@ namespace DbMigrator
                     try
                     {
                         var alterTableScript = $@"
-                ALTER TABLE ""{fk.ForeignKeySchema}"".""{fk.ForeignKeyTable}""
-                ADD CONSTRAINT ""{fk.ConstraintName}""
-                FOREIGN KEY (""{fk.ForeignKeyColumn}"")
-                REFERENCES ""{fk.PrimaryKeySchema}"".""{fk.PrimaryKeyTable}"" (""{fk.PrimaryKeyColumn}"")
-                ON DELETE CASCADE;
-                ";
+                            ALTER TABLE ""{fk.ForeignKeySchema}"".""{fk.ForeignKeyTable}""
+                            ADD CONSTRAINT ""{fk.ConstraintName}""
+                            FOREIGN KEY (""{fk.ForeignKeyColumn}"")
+                            REFERENCES ""{fk.PrimaryKeySchema}"".""{fk.PrimaryKeyTable}"" (""{fk.PrimaryKeyColumn}"")
+                            ON DELETE CASCADE;
+                            ";
 
                         using (var pgCommand = new NpgsqlCommand(alterTableScript, pgConn))
                         {
@@ -259,10 +257,7 @@ namespace DbMigrator
                 }
 
                 if (!progressMade)
-                {
-                    // İlerleme yok, sonsuz döngüyü önlemek için kırıyoruz
                     break;
-                }
             }
 
             if (failedForeignKeys.Count > 0)
@@ -300,7 +295,6 @@ namespace DbMigrator
 
             var tempFile = Path.Combine(folderPath, $"{table.Schema}.{table.Name}.csv");
 
-            // SQL Server'dan CSV dosyasına veri aktar
             try
             {
                 using (var writer = new StreamWriter(tempFile, false, Encoding.UTF8))
@@ -309,7 +303,7 @@ namespace DbMigrator
                     var sqlCommand = new SqlCommand($"SELECT * FROM [{table.Schema}].[{table.Name}]", sqlConn);
                     using (var reader = await sqlCommand.ExecuteReaderAsync())
                     {
-                        // Sütun başlıklarını yaz
+
                         for (int i = 0; i < reader.FieldCount; i++)
                         {
                             csv.WriteField(reader.GetName(i));
@@ -341,7 +335,6 @@ namespace DbMigrator
                 return;
             }
 
-            // PostgreSQL'e COPY komutuyla CSV dosyasından veri aktar
             try
             {
                 var copyCommand = $"COPY \"{table.Schema}\".\"{table.Name}\" FROM STDIN (FORMAT csv, HEADER true)";
