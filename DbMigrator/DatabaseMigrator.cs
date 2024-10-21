@@ -392,15 +392,23 @@ namespace DbMigrator
             {
                 try
                 {
+                    var primaryKeyColumn = table.Columns.FirstOrDefault(c => c.IsPrimaryKey && IsAutoIncrementSupported(c.SqlDataType));
+
+                    if (primaryKeyColumn == null)
+                    {
+                        Console.WriteLine($"Tablo {table.Schema}.{table.Name} için otomatik artan Primary Key bulunamadı, sekans güncellenmeyecek.");
+                        continue;
+                    }
+
                     var updateSequenceCommand = $@"
-                        SELECT setval(pg_get_serial_sequence('""{table.Schema}"".""{table.Name}""', 'Id'),
-                        COALESCE(MAX(""Id""), 1)) 
-                        FROM ""{table.Schema}"".""{table.Name}"";";
+                  SELECT setval(pg_get_serial_sequence('""{table.Schema}"".""{table.Name}""', '{primaryKeyColumn.Name}'),
+                  COALESCE(MAX(""{primaryKeyColumn.Name}""), 1)) 
+                  FROM ""{table.Schema}"".""{table.Name}"";";
 
                     using (var pgCommand = new NpgsqlCommand(updateSequenceCommand, pgConn))
                     {
                         await pgCommand.ExecuteNonQueryAsync();
-                        Console.WriteLine($"Sekans güncellendi: {table.Schema}.{table.Name}");
+                        Console.WriteLine($"Sekans güncellendi: {table.Schema}.{table.Name}.{primaryKeyColumn.Name}");
                     }
                 }
                 catch (Exception ex)
@@ -409,6 +417,7 @@ namespace DbMigrator
                 }
             }
         }
+
 
         private string GetAutoIncrementColumnDefinition(string sqlType)
         {
