@@ -135,7 +135,13 @@ namespace DbMigrator
             sb.AppendLine($"CREATE TABLE IF NOT EXISTS \"{table.Schema}\".\"{table.Name}\" (");
 
             var columnDefinitions = table.Columns.Select(column =>
-                $"\"{column.Name}\" {GetPostgreSqlDataType(column.SqlDataType)} {(column.IsNullable ? "NULL" : "NOT NULL")}");
+            {
+                if (column.IsPrimaryKey)
+                {
+                    return $"\"{column.Name}\" {GetAutoIncrementColumnDefinition(column.SqlDataType)}";
+                }
+                return $"\"{column.Name}\" {GetPostgreSqlDataType(column.SqlDataType)} {(column.IsNullable ? "NULL" : "NOT NULL")}";
+            });
 
             var columnsAndConstraints = new List<string>();
             columnsAndConstraints.AddRange(columnDefinitions);
@@ -147,11 +153,10 @@ namespace DbMigrator
             }
 
             sb.AppendLine(string.Join(",\n", columnsAndConstraints));
-
             sb.AppendLine(");");
+
             return sb.ToString();
         }
-
 
         private async Task<List<ForeignKeyDefinition>> GetForeignKeyDefinitions(SqlConnection sqlConn)
         {
@@ -372,6 +377,19 @@ namespace DbMigrator
                 {
                     Console.WriteLine($"Tekrar aktarımda hata oluştu: {table.Schema}.{table.Name}. Hata: {ex.Message}");
                 }
+            }
+        }
+
+        private string GetAutoIncrementColumnDefinition(string sqlType)
+        {
+            switch (sqlType)
+            {
+                case "int":
+                case "smallint":
+                case "bigint":
+                    return $"{GetPostgreSqlDataType(sqlType)} GENERATED ALWAYS AS IDENTITY";
+                default:
+                    throw new Exception($"Unsupported auto-increment SQL Server data type: {sqlType}");
             }
         }
 
