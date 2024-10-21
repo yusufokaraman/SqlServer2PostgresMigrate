@@ -52,6 +52,8 @@ namespace DbMigrator
                 await MigrateForeignKeysAsync(sqlConn, pgConn);
 
                 Console.WriteLine("Yabancı anahtarlar başarıyla aktarıldı.");
+
+                await UpdateSequences(pgConn, tables);
             }
             catch (Exception ex)
             {
@@ -376,6 +378,30 @@ namespace DbMigrator
                 catch (Exception ex)
                 {
                     Console.WriteLine($"Tekrar aktarımda hata oluştu: {table.Schema}.{table.Name}. Hata: {ex.Message}");
+                }
+            }
+        }
+
+        private async Task UpdateSequences(NpgsqlConnection pgConn, List<TableDefinition> tables)
+        {
+            foreach (var table in tables)
+            {
+                try
+                {
+                    var updateSequenceCommand = $@"
+                        SELECT setval(pg_get_serial_sequence('""{table.Schema}"".""{table.Name}""', 'Id'),
+                        COALESCE(MAX(""Id""), 1)) 
+                        FROM ""{table.Schema}"".""{table.Name}"";";
+
+                    using (var pgCommand = new NpgsqlCommand(updateSequenceCommand, pgConn))
+                    {
+                        await pgCommand.ExecuteNonQueryAsync();
+                        Console.WriteLine($"Sekans güncellendi: {table.Schema}.{table.Name}");
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"Sekans güncellenirken hata oluştu: {table.Schema}.{table.Name}. Hata: {ex.Message}");
                 }
             }
         }
