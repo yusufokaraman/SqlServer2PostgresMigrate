@@ -130,7 +130,6 @@ namespace DbMigrator
             return tables;
         }
 
-
         private string GenerateCreateTableScript(TableDefinition table)
         {
             var sb = new StringBuilder();
@@ -138,7 +137,7 @@ namespace DbMigrator
 
             var columnDefinitions = table.Columns.Select(column =>
             {
-                if (column.IsPrimaryKey)
+                if (column.IsPrimaryKey && IsAutoIncrementSupported(column.SqlDataType))
                 {
                     return $"\"{column.Name}\" {GetAutoIncrementColumnDefinition(column.SqlDataType)}";
                 }
@@ -158,6 +157,11 @@ namespace DbMigrator
             sb.AppendLine(");");
 
             return sb.ToString();
+        }
+
+        private bool IsAutoIncrementSupported(string sqlType)
+        {
+            return sqlType == "int" || sqlType == "smallint" || sqlType == "bigint";
         }
 
         private async Task<List<ForeignKeyDefinition>> GetForeignKeyDefinitions(SqlConnection sqlConn)
