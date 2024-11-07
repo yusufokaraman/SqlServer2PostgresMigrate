@@ -3,6 +3,7 @@ using Microsoft.Data.SqlClient;
 using Npgsql;
 using System.Globalization;
 using System.Text;
+using System.Text.RegularExpressions;
 
 namespace DbMigrator
 {
@@ -10,10 +11,14 @@ namespace DbMigrator
     {
         private Queue<TableDefinition> failedTables = new Queue<TableDefinition>();
 
+        bool isFreshMigration = true;
+
         public async Task MigrateDatabaseAsync(SqlConnection sqlConn, NpgsqlConnection pgConn)
         {
             try
             {
+                await DisableForeignKeys(pgConn);
+
                 var tables = await GetTableDefinitions(sqlConn);
                 Console.WriteLine($"Toplam Tablo Sayısı: {tables.Count}");
 
@@ -33,7 +38,7 @@ namespace DbMigrator
 
                         Console.WriteLine($"Tablo oluşturuldu: {table.Schema}.{table.Name}");
 
-                        await BatchMigrateData(table, sqlConn, pgConn);
+                        await BatchMigrateData(table, sqlConn, pgConn, isFreshMigration);
 
                         tableCount++;
                         Console.WriteLine($"İlerleme: %{((double)tableCount / tables.Count) * 100:0.00}");
@@ -48,6 +53,8 @@ namespace DbMigrator
                 Console.WriteLine("Veritabanı aktarımı tamamlandı.");
 
                 await RetryFailedTables(sqlConn, pgConn);
+
+                await EnableForeignKeys(sqlConn, pgConn);
 
                 await MigrateForeignKeysAsync(sqlConn, pgConn);
 
@@ -133,15 +140,19 @@ namespace DbMigrator
         private string GenerateCreateTableScript(TableDefinition table)
         {
             var sb = new StringBuilder();
-            sb.AppendLine($"CREATE TABLE IF NOT EXISTS \"{table.Schema}\".\"{table.Name}\" (");
+            string schema = table.Schema.ToLower().Replace("ı", "i");
+            string tableName = table.Name.ToLower().Replace("ı", "i");
+
+            sb.AppendLine($"CREATE TABLE IF NOT EXISTS \"{schema}\".\"{tableName}\" (");
 
             var columnDefinitions = table.Columns.Select(column =>
             {
+                string columnName = column.Name.ToLower().Replace("ı", "i");
                 if (column.IsPrimaryKey && IsAutoIncrementSupported(column.SqlDataType))
                 {
-                    return $"\"{column.Name}\" {GetAutoIncrementColumnDefinition(column.SqlDataType)}";
+                    return $"\"{columnName}\" {GetAutoIncrementColumnDefinition(column.SqlDataType)}";
                 }
-                return $"\"{column.Name}\" {GetPostgreSqlDataType(column.SqlDataType)} {(column.IsNullable ? "NULL" : "NOT NULL")}";
+                return $"\"{columnName}\" {GetPostgreSqlDataType(column.SqlDataType)} {(column.IsNullable ? "NULL" : "NOT NULL")}";
             });
 
             var columnsAndConstraints = new List<string>();
@@ -149,7 +160,8 @@ namespace DbMigrator
 
             if (table.Columns.Any(c => c.IsPrimaryKey))
             {
-                var primaryKeyColumns = table.Columns.Where(c => c.IsPrimaryKey).Select(c => $"\"{c.Name}\"");
+                var primaryKeyColumns = table.Columns.Where(c => c.IsPrimaryKey)
+                                                     .Select(c => $"\"{c.Name.ToLower().Replace("ı", "i")}\"");
                 columnsAndConstraints.Add($"PRIMARY KEY ({string.Join(", ", primaryKeyColumns)})");
             }
 
@@ -235,12 +247,14 @@ namespace DbMigrator
 
                     try
                     {
+                        ///Yabancı Anahtar kısıtlamaları başta etkin olmayacak.
                         var alterTableScript = $@"
                             ALTER TABLE ""{fk.ForeignKeySchema}"".""{fk.ForeignKeyTable}""
                             ADD CONSTRAINT ""{fk.ConstraintName}""
                             FOREIGN KEY (""{fk.ForeignKeyColumn}"")
                             REFERENCES ""{fk.PrimaryKeySchema}"".""{fk.PrimaryKeyTable}"" (""{fk.PrimaryKeyColumn}"")
                             ON DELETE CASCADE;
+                            DEFERRABLE INITIALLY DEFERRED;
                             ";
 
                         using (var pgCommand = new NpgsqlCommand(alterTableScript, pgConn))
@@ -285,7 +299,6 @@ namespace DbMigrator
             }
         }
 
-
         private async Task CreateSchemaIfNotExists(string schemaName, NpgsqlConnection pgConn)
         {
             var createSchemaCommand = $"CREATE SCHEMA IF NOT EXISTS \"{schemaName}\"";
@@ -296,7 +309,7 @@ namespace DbMigrator
             }
         }
 
-        private async Task BatchMigrateData(TableDefinition table, SqlConnection sqlConn, NpgsqlConnection pgConn)
+        private async Task BatchMigrateData(TableDefinition table, SqlConnection sqlConn, NpgsqlConnection pgConn, bool isFreshMigration)
         {
             var folderPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "CsvExports");
             if (!Directory.Exists(folderPath))
@@ -305,34 +318,48 @@ namespace DbMigrator
             }
 
             var tempFile = Path.Combine(folderPath, $"{table.Schema}.{table.Name}.csv");
+            List<string> commonColumns;
+
+            if (isFreshMigration)
+            {
+                // PostgreSQL uyumlu kolon adları (küçük harfe çevirme ve `ı`'yı `i` ile değiştirme)
+                commonColumns = table.Columns.Select(c => c.Name.ToLower().Replace("ı", "i")).ToList();
+            }
+            else
+            {
+                var postgresColumns = await GetPostgreSqlColumns(table.Schema.ToLower().Replace("ı", "i"), table.Name.ToLower().Replace("ı", "i"), pgConn);
+                commonColumns = table.Columns
+                    .Where(c => postgresColumns.Contains(c.Name.ToLower().Replace("ı", "i")))
+                    .Select(c => c.Name)
+                    .ToList();
+
+                if (commonColumns.Count == 0)
+                {
+                    Console.WriteLine($"Ortak kolon bulunamadı: {table.Schema}.{table.Name}");
+                    return;
+                }
+            }
 
             try
             {
                 using (var writer = new StreamWriter(tempFile, false, Encoding.UTF8))
                 using (var csv = new CsvWriter(writer, CultureInfo.InvariantCulture))
                 {
-                    var sqlCommand = new SqlCommand($"SELECT * FROM [{table.Schema}].[{table.Name}]", sqlConn);
+                    foreach (var column in commonColumns)
+                    {
+                        csv.WriteField(column.ToLower().Replace("ı", "i"));  // PostgreSQL'e uygun hale getir
+                    }
+                    await csv.NextRecordAsync();
+
+                    var sqlCommand = new SqlCommand($"SELECT {string.Join(",", commonColumns.Select(c => $"[{c}]"))} FROM [{table.Schema}].[{table.Name}]", sqlConn);
                     using (var reader = await sqlCommand.ExecuteReaderAsync())
                     {
-
-                        for (int i = 0; i < reader.FieldCount; i++)
-                        {
-                            csv.WriteField(reader.GetName(i));
-                        }
-                        await csv.NextRecordAsync();
-
                         while (await reader.ReadAsync())
                         {
-                            for (int i = 0; i < reader.FieldCount; i++)
+                            foreach (var column in commonColumns)
                             {
-                                if (reader.IsDBNull(i))
-                                {
-                                    csv.WriteField(string.Empty);
-                                }
-                                else
-                                {
-                                    csv.WriteField(reader.GetValue(i));
-                                }
+                                var value = reader.IsDBNull(reader.GetOrdinal(column)) ? (object)DBNull.Value : reader.GetValue(reader.GetOrdinal(column));
+                                csv.WriteField(value ?? string.Empty);
                             }
                             await csv.NextRecordAsync();
                         }
@@ -342,13 +369,12 @@ namespace DbMigrator
             catch (Exception ex)
             {
                 Console.WriteLine($"CSV dosyası oluşturulurken hata oluştu: {ex.Message}");
-                Console.WriteLine($"Hata Detayı: {ex}");
                 return;
             }
 
             try
             {
-                var copyCommand = $"COPY \"{table.Schema}\".\"{table.Name}\" FROM STDIN (FORMAT csv, HEADER true)";
+                var copyCommand = $"COPY \"{table.Schema.ToLower().Replace("ı", "i")}\".\"{table.Name.ToLower().Replace("ı", "i")}\" ({string.Join(",", commonColumns.Select(c => $"\"{c.ToLower().Replace("ı", "i")}\""))}) FROM STDIN (FORMAT csv, HEADER true)";
                 using (var pgWriter = pgConn.BeginTextImport(copyCommand))
                 using (var reader = new StreamReader(tempFile))
                 {
@@ -363,8 +389,87 @@ namespace DbMigrator
             catch (Exception ex)
             {
                 Console.WriteLine($"COPY komutuyla aktarım sırasında hata oluştu: {ex.Message}");
+                Console.WriteLine($"Hata: {ex}");
+            }
+        }
+
+
+
+        private async Task DisableForeignKeys(NpgsqlConnection pgConn)
+        {
+            var disableForeignKeysCommand = @"
+    DO
+    $$
+    DECLARE
+        tbl RECORD;
+    BEGIN
+        FOR tbl IN 
+            SELECT tc.table_schema, tc.table_name, tc.constraint_name 
+            FROM information_schema.table_constraints AS tc
+            WHERE tc.constraint_type = 'FOREIGN KEY'
+              AND tc.table_schema NOT IN ('pg_catalog', 'information_schema')
+        LOOP
+            EXECUTE format('ALTER TABLE %I.%I DROP CONSTRAINT %I', tbl.table_schema, tbl.table_name, tbl.constraint_name);
+        END LOOP;
+    END
+    $$;";
+
+            using (var command = new NpgsqlCommand(disableForeignKeysCommand, pgConn))
+            {
+                await command.ExecuteNonQueryAsync();
+                Console.WriteLine("Tüm yabancı anahtarlar devre dışı bırakıldı.");
+            }
+        }
+
+        private async Task EnableForeignKeys(SqlConnection sqlConn, NpgsqlConnection pgConn)
+        {
+            var foreignKeys = await GetForeignKeyDefinitions(sqlConn);
+
+            foreach (var fk in foreignKeys)
+            {
+                try
+                {
+                    var enableForeignKeyCommand = $@"
+                ALTER TABLE ""{fk.ForeignKeySchema}"".""{fk.ForeignKeyTable}""
+                ADD CONSTRAINT ""{fk.ConstraintName}""
+                FOREIGN KEY (""{fk.ForeignKeyColumn}"")
+                REFERENCES ""{fk.PrimaryKeySchema}"".""{fk.PrimaryKeyTable}"" (""{fk.PrimaryKeyColumn}"")
+                ON DELETE CASCADE
+                DEFERRABLE INITIALLY DEFERRED;";
+
+                    using (var pgCommand = new NpgsqlCommand(enableForeignKeyCommand, pgConn))
+                    {
+                        await pgCommand.ExecuteNonQueryAsync();
+                    }
+
+                    Console.WriteLine($"Yabancı anahtar etkinleştirildi: {fk.ConstraintName}");
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"Yabancı anahtar etkinleştirilirken hata oluştu: {fk.ConstraintName}. Hata: {ex.Message}");
+                }
             }
 
+            Console.WriteLine("Tüm yabancı anahtarlar başarıyla etkinleştirildi.");
+        }
+
+        private async Task<List<string>> GetPostgreSqlColumns(string schema, string tableName, NpgsqlConnection pgConn)
+        {
+            var columns = new List<string>();
+            var query = $@"
+                SELECT column_name 
+                FROM information_schema.columns 
+                WHERE table_schema = '{schema}' AND table_name = '{tableName}';";
+
+            using (var command = new NpgsqlCommand(query, pgConn))
+            using (var reader = await command.ExecuteReaderAsync())
+            {
+                while (await reader.ReadAsync())
+                {
+                    columns.Add(reader.GetString(0));
+                }
+            }
+            return columns;
         }
 
         private async Task RetryFailedTables(SqlConnection sqlConn, NpgsqlConnection pgConn)
@@ -376,7 +481,7 @@ namespace DbMigrator
                 {
                     Console.WriteLine($"Hatalı tabloyu tekrar aktarıyor: {table.Schema}.{table.Name}");
                     await EnsureConnectionOpen(pgConn);
-                    await BatchMigrateData(table, sqlConn, pgConn);
+                    await BatchMigrateData(table, sqlConn, pgConn, isFreshMigration);
                     Console.WriteLine($"Tablo başarıyla aktarıldı: {table.Schema}.{table.Name}");
                 }
                 catch (Exception ex)
@@ -400,10 +505,14 @@ namespace DbMigrator
                         continue;
                     }
 
+                    var schemaName = table.Schema.ToLower().Replace("ı", "i");
+                    var tableName = table.Name.ToLower().Replace("ı", "i");
+                    var columnName = primaryKeyColumn.Name.ToLower().Replace("ı", "i");
+
                     var updateSequenceCommand = $@"
-                  SELECT setval(pg_get_serial_sequence('""{table.Schema}"".""{table.Name}""', '{primaryKeyColumn.Name}'),
-                  COALESCE(MAX(""{primaryKeyColumn.Name}""), 1)) 
-                  FROM ""{table.Schema}"".""{table.Name}"";";
+                        SELECT setval(pg_get_serial_sequence('""{schemaName}"".""{tableName}""', '{columnName}'),
+                        COALESCE(MAX(""{columnName}""), 1)) 
+                        FROM ""{schemaName}"".""{tableName}"";";
 
                     using (var pgCommand = new NpgsqlCommand(updateSequenceCommand, pgConn))
                     {
